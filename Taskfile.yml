@@ -1,0 +1,44 @@
+version: '3'
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  example:embedded:
+    desc: Run the standalone embedding example
+    cmds:
+      - go run ./examples/embedded {{.CLI_ARGS}}
+
+  example:serve:
+    desc: Start the demo server at https://nats-workflows.localhost
+    aliases: [dev]
+    cmds:
+      - portless nats-workflows go run ./cmd/nats-workflows serve {{.CLI_ARGS}}
+
+  example:order:
+    desc: Run the order workflow (optional amount after --)
+    cmds:
+      - go run ./cmd/nats-workflows order {{.CLI_ARGS}}
+
+  example:random:
+    desc: Run the random SWAPI workflow
+    cmds:
+      - go run ./cmd/nats-workflows random {{.CLI_ARGS}}
+
+  example:choose:
+    desc: Run or resume the interactive SWAPI workflow
+    interactive: true
+    cmds:
+      - go run ./cmd/nats-workflows choose {{.CLI_ARGS}}
+
+  example:ask:
+    desc: Ask the AI workflow (requires OPENROUTER_API_KEY)
+    interactive: true
+    cmds:
+      - go run ./cmd/nats-workflows ask {{.CLI_ARGS}}
+
+  cli:
+    desc: Run a CLI command passed after --
+    cmds:
+      - go run ./cmd/nats-workflows {{.CLI_ARGS}}

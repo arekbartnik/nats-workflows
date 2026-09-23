@@ -1,0 +1,474 @@
+openapi: 3.0.3
+info:
+  title: nats-workflows API
+  description: |
+    HTTP interface to the durable workflow engine on NATS JetStream.
+
+    Workflows are Go code registered at startup. This API starts Runs, watches
+    their progress, accepts typed Hook input through Resume or callback
+    submission, and retries failed Runs from the Step that failed.
+    Acceptance receipts are independent of Step completion.
+
+    A run is always in exactly one status:
+    - `scheduled` — waiting until start_at and an executor are available
+    - `cancelled` — cancelled before execution began
+    - `running` — a step message is in flight
+    - `parked` — waiting for Hook input from a human or callback
+    - `done` — finished; `result` holds the rendered output
+    - `failed` — a step exhausted its retry budget or hit a terminal error
+  version: 1.0.0
+servers:
+  - url: /
+# No auth: the API trusts its network, same as the NATS port.
+security: []
+tags:
+  - name: workflows
+    description: Registered workflow definitions
+  - name: runs
+    description: Durable executions of workflows
+paths:
+  /api/v1/workflows:
+    get:
+      tags: [workflows]
+      summary: List registered workflows
+      operationId: listWorkflows
+      responses:
+        "200":
+          description: The workflows this engine can run, sorted by name.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Workflow"
+  /api/v1/runs:
+    get:
+      tags: [runs]
+      summary: List runs
+      description: Every run in the KV bucket, most recently updated first.
+      operationId: listRuns
+      parameters:
+        - name: status
+          in: query
+          description: Only runs in this status.
+          schema:
+            $ref: "#/components/schemas/Status"
+        - name: workflow
+          in: query
+          description: Only runs of this workflow.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Matching runs.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Run"
+    post:
+      tags: [runs]
+      summary: Start a run
+      description: |
+        Creates a run. Without `start_at`, enqueues its first step immediately.
+        With a future RFC3339 `start_at` including a timezone, saves a scheduled
+        run that starts no earlier than that instant. Overdue runs start when
+        workers recover. `state`, when present,
+        seeds the run's initial state — the JSON form of the workflow's own
+        state struct, so the first step can receive parameters.
+
+        Returns immediately; follow progress with `GET /runs/{id}` or the
+        long-polling `GET /runs/{id}/wait`.
+      operationId: startRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/StartRequest"
+            examples:
+              ask:
+                summary: Ask AI a question
+                value:
+                  workflow: ask
+                  state: { question: "Why is the sky blue?" }
+              order:
+                summary: Order pipeline (amount >= 500 parks for fraud review)
+                value:
+                  workflow: order
+                  state: { order: { item: "starship model kit", qty: 1, amount: 750 } }
+              swapi:
+                summary: Random Star Wars person, no parameters
+                value:
+                  workflow: swapi
+      responses:
+        "201":
+          description: The newly created run, scheduled or already executing.
+          headers:
+            Location:
+              description: URL of the new run.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /api/v1/runs/{id}:
+    get:
+      tags: [runs]
+      summary: Get a run
+      operationId: getRun
+      parameters:
+        - $ref: "#/components/parameters/runID"
+      responses:
+        "200":
+          description: The run's current state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/runs/{id}/history:
+    get:
+      tags: [runs]
+      summary: Get a run's history
+      description: |
+        The run's stored revisions, oldest first — one snapshot per state
+        change (step advances, parks, resumes, failures), as deep as the
+        engine's KV history keeps (the last 64 revisions).
+      operationId: getRunHistory
+      parameters:
+        - $ref: "#/components/parameters/runID"
+      responses:
+        "200":
+          description: The run's revisions, oldest first.
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /api/v1/runs/{id}/resume:
+    post:
+      tags: [runs]
+      summary: Submit input to a specific Hook owned by this Run
+      description: |
+        Accepts typed Hook input, including before Park. Retain the token and
+        submission_id across retries. The same ID and equivalent JSON recover
+        the original receipt. Acceptance does not mean the Step completed.
+        Arbitrary State patches are no longer supported.
+      operationId: resumeRun
+      parameters:
+        - $ref: "#/components/parameters/runID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Submission"
+            example:
+              token: your-hook-token
+              submission_id: approval-action-123
+              payload: { decision: approve }
+      responses:
+        "202":
+          description: Input durably accepted, or the original receipt for an identical retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Receipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Another submission won, the payload changed, or the Hook is not active or owned by this Run.
+        "410":
+          description: The Hook's Run was removed after retention. Its token remains reserved.
+        "503":
+          description: Acceptance capacity exhausted. No input was accepted.
+  /api/v1/hooks/submit:
+    post:
+      tags: [runs]
+      summary: Submit a callback by Hook token
+      description: |
+        Uses the same validation, first-winner acceptance and receipts as Resume.
+        Intended for trusted local/private access. Tokens are addresses, not credentials.
+      operationId: submitHook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Submission"
+      responses:
+        "202":
+          description: Input accepted, independently of execution progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Receipt"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Conflicting submission or inactive Hook.
+        "410":
+          description: Hook cleaned up; token permanently reserved.
+        "503":
+          description: Acceptance capacity exhausted.
+  /api/v1/runs/{id}/retry:
+    post:
+      tags: [runs]
+      summary: Retry a failed run
+      description: |
+        Re-runs a failed run from the step that failed, with a fresh retry
+        budget. Earlier steps' outputs are untouched — a retry never rewinds.
+      operationId: retryRun
+      parameters:
+        - $ref: "#/components/parameters/runID"
+      responses:
+        "200":
+          description: The run after the retry was enqueued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The run is not failed (parked runs are resumed, not retried).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+  /api/v1/runs/{id}/cancel:
+    post:
+      tags: [runs]
+      summary: Cancel a scheduled run
+      operationId: cancelRun
+      parameters:
+        - $ref: "#/components/parameters/runID"
+      responses:
+        "200":
+          description: The cancelled run. No step will execute.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/ScheduleConflict"
+  /api/v1/runs/{id}/reschedule:
+    post:
+      tags: [runs]
+      summary: Change a scheduled run's start time
+      operationId: rescheduleRun
+      parameters:
+        - $ref: "#/components/parameters/runID"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [start_at]
+              properties:
+                start_at:
+                  type: string
+                  format: date-time
+                  description: Future RFC3339 timestamp with an explicit timezone.
+      responses:
+        "200":
+          description: The rescheduled run, preserving its ID and initial state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/ScheduleConflict"
+  /api/v1/runs/{id}/wait:
+    get:
+      tags: [runs]
+      summary: Wait for a run to park or end
+      description: |
+        Long-polls until the run reaches `parked`, `done`, `failed`, or `cancelled`, or
+        the timeout elapses — in which case the run's latest snapshot is
+        returned and the caller decides whether to poll again. Runs are
+        durable; nothing is lost between polls.
+      operationId: waitRun
+      parameters:
+        - $ref: "#/components/parameters/runID"
+        - name: timeout
+          in: query
+          description: How long to wait, as a Go duration (default 30s, max 5m).
+          schema:
+            type: string
+            example: 60s
+      responses:
+        "200":
+          description: The run, settled or as of the timeout.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Run"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+components:
+  parameters:
+    runID:
+      name: id
+      in: path
+      required: true
+      description: Run ID (a UUIDv7, assigned at start).
+      schema:
+        type: string
+  responses:
+    ScheduleConflict:
+      description: The run is no longer scheduled or a concurrent transition won. Read it again before retrying.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: Malformed request.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: No such run.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Submission:
+      type: object
+      additionalProperties: false
+      required: [token, submission_id, payload]
+      properties:
+        token: { type: string, minLength: 1, maxLength: 1024 }
+        submission_id: { type: string, minLength: 1, maxLength: 256 }
+        payload:
+          description: Typed input for this Hook. Default JSON size limit is 64 KiB.
+    Receipt:
+      type: object
+      required: [token, submission_id, accepted_at]
+      properties:
+        token: { type: string }
+        submission_id: { type: string }
+        accepted_at: { type: string, format: date-time }
+    Hook:
+      type: object
+      required: [name, token, run_id, step, contract, status]
+      properties:
+        name: { type: string }
+        token: { type: string }
+        run_id: { type: string }
+        step: { type: integer }
+        contract: { type: string }
+        status: { type: string, enum: [pending, accepted, consumed, gone] }
+        receipt:
+          $ref: "#/components/schemas/Receipt"
+        payload:
+          description: The retained accepted input.
+
+    Status:
+      type: string
+      description: A run's lifecycle state.
+      enum: [scheduled, running, parked, done, failed, cancelled]
+    Workflow:
+      type: object
+      required: [name, steps]
+      properties:
+        name:
+          type: string
+          example: order
+        steps:
+          type: array
+          description: Step names, in execution order.
+          items:
+            type: string
+          example: [validate-order, reserve-inventory, fraud-score]
+    StartRequest:
+      type: object
+      required: [workflow]
+      properties:
+        start_at:
+          type: string
+          format: date-time
+          description: Future RFC3339 timestamp including timezone. Omit to start immediately.
+        workflow:
+          type: string
+          description: Name of a registered workflow.
+        state:
+          type: object
+          additionalProperties: true
+          description: >
+            Initial state — the JSON form of the workflow's own state struct.
+            Omit for workflows that need no parameters.
+    Run:
+      type: object
+      required: [id, workflow, status, step, step_name, updated]
+      properties:
+        hooks:
+          type: array
+          items:
+            $ref: "#/components/schemas/Hook"
+        start_at:
+          type: string
+          format: date-time
+          description: Scheduled start time in UTC, retained after execution starts.
+        expires_at:
+          type: string
+          format: date-time
+          description: Cleanup deadline, seven days after entering done, failed, or cancelled. Pending runs have no expiry.
+        id:
+          type: string
+          example: 0198c8a1-2f3b-7c4d-9e5f-6a7b8c9d0e1f
+        workflow:
+          type: string
+          example: order
+        status:
+          $ref: "#/components/schemas/Status"
+        step:
+          type: integer
+          description: Index of the step being executed or waited on.
+        step_name:
+          type: string
+          description: Name of that step, or "-" once past the last one.
+        error:
+          type: string
+          description: Why the run failed. Only on failed runs.
+        state:
+          type: object
+          additionalProperties: true
+          description: The workflow's own typed state, opaque to the engine.
+        result:
+          type: string
+          description: Rendered final output. Only on done runs.
+        updated:
+          type: string
+          format: date-time
+          description: When the run last changed.
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string

@@ -1,0 +1,11 @@
+# Native JetStream backoff and revision-based dedup
+
+The engine leans on JetStream primitives instead of hand-rolled equivalents wherever JetStream offers one. Two decisions here are surprising without context:
+
+**Retry backoff is the consumer's `BackOff` schedule (`2m, 2m, 3m, 4m`), not computed delays.** `fail()` does a plain `Nak()` and the server schedules redelivery. The trade-off we accepted: with `BackOff` set, the schedule also governs redelivery of *unacked* (crashed-executor) messages — the first entry effectively replaces `AckWait`. So the first retry after a step error waits 2 minutes (previously 10 seconds), because the schedule must start no shorter than the slowest step (the LLM call) needs to finish. `AckWait` is kept equal to `BackOff[0]` since they must agree. Failure detection stays as a `NumDelivered` check in the handler — the `MAX_DELIVERIES` advisory was rejected because advisories are fire-and-forget core-NATS messages: miss one during a deploy and the run is stuck in `running` forever with no message in flight.
+
+**The Msg-Id dedup generation is the run's KV revision (`runID:step:revision`), not a counter in the Run.** `Retry` and `Resume` each `Put` the run anyway, so the server-assigned revision bumps and mints a fresh Msg-Id past the dedup window — no hand-maintained `Retries` field in the durable schema. Crash-recovery re-publishes still dedup exactly, because a redelivered handler reads the same revision the crashed instance would have published with. Consequence: calling `Resume` twice publishes two messages instead of deduping; the stale-step guard acks the extra one harmlessly.
+
+The one deliberately hand-rolled piece that stays is the stale-message re-enqueue in `handle`: JetStream can redeliver an unacked message, but deciding what recovery means for a half-advanced run (save state → publish next → ack current) is application logic JetStream cannot know.
+
+**Amendment (2026-08-01):** the schedule and MaxDeliver are now `engine.Config` parameters; the zero value keeps the defaults above, so the decision stands. The parameter exists so tests can substitute ms-scale schedules and exercise the failure paths through the same interface production uses (see `engine/engine_test.go`).

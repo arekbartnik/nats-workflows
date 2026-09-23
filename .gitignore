@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+data
+/nats-workflows
+
+# Local build and test output
+*.test
+coverage.out
+coverage.html
+*.prof
+*.log
+.task/
+
+# macOS metadata
+.DS_Store
