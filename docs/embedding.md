@@ -66,6 +66,9 @@ func orderWorkflow(orders *OrderService) engine.Workflow {
 `OrderService` and `OrderState` are types supplied by your app. Pass its HTTP
 clients, database handles and other dependencies through closures like this.
 Steps must honor context cancellation and tolerate redelivery after a crash.
+A Step may run longer than the ack wait: the engine heartbeats its delivery and
+cancels its context after `Step.Timeout`, which defaults to the first `BackOff`
+delay. `Config.Concurrency` sets how many Steps one process runs at once.
 Use a stable idempotency key for external effects, such as the Run ID plus the
 Step name. A successful external call can be repeated if the process stops
 before the engine persists the next State.

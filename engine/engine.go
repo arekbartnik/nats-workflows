@@ -23,8 +23,9 @@ type Config struct {
 	// use compatible workflows and configuration. Allowed: 1-64 ASCII letters,
 	// digits, underscores or hyphens.
 	Namespace string
-	// The first delay overrides AckWait and must allow the slowest Step to
-	// finish. Empty defaults to 2m, 2m, 3m, 4m.
+	// The first delay overrides AckWait and is the default Step timeout. A
+	// running Step heartbeats, so only crashed executors wait it out. Empty
+	// defaults to 2m, 2m, 3m, 4m.
 	BackOff []time.Duration
 	// Must be at least len(BackOff)+1. Zero defaults to 5.
 	MaxDeliver int
@@ -34,6 +35,8 @@ type Config struct {
 	HookMaxBytes int64
 	// Rejects new work when full. Zero defaults to 64 MiB.
 	StepMaxBytes int64
+	// Steps executing at once in this process. Zero defaults to 1.
+	Concurrency int
 }
 
 // Wrap with %w to fail immediately without using the remaining retry budget.
@@ -61,6 +64,9 @@ type Step struct {
 	Name  string
 	Input *InputContract
 	Run   func(ctx context.Context, run *Run) error
+	// Bounds one attempt; exceeding it counts as a failed attempt. Zero
+	// defaults to the first BackOff delay.
+	Timeout time.Duration
 }
 
 type Workflow struct {
@@ -147,6 +153,9 @@ type Engine struct {
 	starts           jetstream.Consumer
 	workflows        map[string]Workflow
 	maxDeliver       int
+	concurrency      int
+	stepTimeout      time.Duration
+	heartbeat        time.Duration
 	log              *slog.Logger
 }
 
@@ -179,6 +188,19 @@ func New(ctx context.Context, nc *nats.Conn, log *slog.Logger, cfg Config, wfs .
 	for _, delay := range cfg.BackOff {
 		if delay <= 0 {
 			return nil, errors.New("BackOff durations must be positive")
+		}
+	}
+	if cfg.Concurrency == 0 {
+		cfg.Concurrency = 1
+	}
+	if cfg.Concurrency < 0 {
+		return nil, errors.New("Concurrency must not be negative")
+	}
+	for _, wf := range workflows {
+		for _, step := range wf.Steps {
+			if step.Timeout < 0 {
+				return nil, fmt.Errorf("workflow %q step %q has a negative timeout", wf.Name, step.Name)
+			}
 		}
 	}
 	if cfg.HookPayloadLimit < 0 || cfg.HookMaxBytes < 0 {
@@ -227,7 +249,13 @@ func New(ctx context.Context, nc *nats.Conn, log *slog.Logger, cfg Config, wfs .
 		return nil, fmt.Errorf("creating %s bucket: %w", names.runs, err)
 	}
 
-	e := &Engine{names: names, js: js, kv: kv, cons: cons, workflows: workflows, maxDeliver: cfg.MaxDeliver, log: log}
+	e := &Engine{
+		names: names, js: js, kv: kv, cons: cons, workflows: workflows, maxDeliver: cfg.MaxDeliver, log: log,
+		concurrency: cfg.Concurrency,
+		stepTimeout: cfg.BackOff[0],
+		// The server resets the ack timer to the shortest delay at worst.
+		heartbeat: slices.Min(cfg.BackOff) / 3,
+	}
 	if err := e.initHooks(ctx, cfg); err != nil {
 		return nil, err
 	}
@@ -337,18 +365,12 @@ func (e *Engine) Serve(ctx context.Context) error {
 		return err
 	}
 	consumers = append(consumers, sc)
-	cc, err := e.cons.Consume(func(msg jetstream.Msg) {
-		callbacks.RLock()
-		defer callbacks.RUnlock()
-		if ctx.Err() == nil {
-			e.handle(ctx, msg)
-		}
-	})
-	if err != nil {
-		return err
-	}
-	consumers = append(consumers, cc)
-	startsClosed, stepsClosed := sc.Closed(), cc.Closed()
+	stepsClosed := make(chan struct{})
+	go func() {
+		defer close(stepsClosed)
+		e.executeSteps(ctx, &callbacks)
+	}()
+	startsClosed := sc.Closed()
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -359,10 +381,69 @@ func (e *Engine) Serve(ctx context.Context) error {
 		case <-startsClosed:
 			return errors.New("schedule consumer stopped unexpectedly")
 		case <-stepsClosed:
+			if ctx.Err() != nil {
+				return nil
+			}
 			return errors.New("step consumer stopped unexpectedly")
 		case <-ticker.C:
 		}
 	}
+}
+
+// executeSteps pulls a Step only when a slot is free. A prefetched delivery
+// waiting for a slot would outlive its ack wait and run twice. It returns
+// when ctx ends or the consumer is gone.
+func (e *Engine) executeSteps(ctx context.Context, callbacks *sync.RWMutex) {
+	slots := make(chan struct{}, e.concurrency)
+	for {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		msg, err := e.nextStep(ctx)
+		if msg == nil {
+			<-slots
+			if ctx.Err() != nil || errors.Is(err, nats.ErrConnectionClosed) ||
+				errors.Is(err, jetstream.ErrConsumerDeleted) || errors.Is(err, jetstream.ErrConsumerNotFound) {
+				return
+			}
+			if err != nil {
+				e.log.Warn("fetching step", "err", err)
+				select {
+				case <-time.After(time.Second):
+				case <-ctx.Done():
+					return
+				}
+			}
+			continue
+		}
+		callbacks.RLock()
+		go func() {
+			defer func() { <-slots }()
+			defer callbacks.RUnlock()
+			if ctx.Err() == nil {
+				e.handle(ctx, msg)
+			}
+		}()
+	}
+}
+
+// nextStep long-polls for one delivery; nil without an error means none came.
+func (e *Engine) nextStep(ctx context.Context) (jetstream.Msg, error) {
+	pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	batch, err := e.cons.Fetch(1, jetstream.FetchContext(pollCtx))
+	if err != nil {
+		return nil, err
+	}
+	for msg := range batch.Messages() {
+		return msg, nil
+	}
+	if err := batch.Error(); err != nil && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		return nil, err
+	}
+	return nil, nil
 }
 
 // Persist State, publish the next Step, then ack. A crash between these
@@ -409,7 +490,7 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	run.engine = e
 	step := wf.Steps[sm.Step]
 	e.log.Info("step start", "run", run.ID, "step", sm.Step, "name", step.Name)
-	if err := step.Run(ctx, run); err != nil {
+	if err := e.runStep(ctx, msg, step, run); err != nil {
 		if errors.Is(err, ErrPark) {
 			run.Status = StatusParked
 			if perr := e.putRun(ctx, run); perr != nil {
@@ -447,6 +528,30 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	}
 	msg.Ack()
 	e.log.Info("step done", "run", run.ID, "step", sm.Step, "name", step.Name, "status", run.Status)
+}
+
+// runStep keeps the delivery in progress while the Step runs, so a Step may
+// outlast the ack wait up to its timeout.
+func (e *Engine) runStep(ctx context.Context, msg jetstream.Msg, step Step, run *Run) error {
+	stepCtx, cancel := context.WithTimeout(ctx, cmp.Or(step.Timeout, e.stepTimeout))
+	defer cancel()
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		ticker := time.NewTicker(e.heartbeat)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if err := msg.InProgress(); err != nil {
+					e.log.Warn("step heartbeat", "run", run.ID, "step", run.Step, "err", err)
+				}
+			}
+		}
+	}()
+	return step.Run(stepCtx, run)
 }
 
 func (e *Engine) fail(ctx context.Context, msg jetstream.Msg, run *Run, err error) {
