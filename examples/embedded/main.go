@@ -56,12 +56,12 @@ func run(ctx context.Context, storeDir string, out io.Writer) (err error) {
 	var workerErr error
 	go func() {
 		workerErr = eng.Serve(ctx)
-		cancel() // Wake callers if the worker stops unexpectedly.
+		cancel()
 		close(done)
 	}()
 	defer func() {
 		cancel()
-		<-done // Wait for callbacks before closing NATS.
+		<-done
 		err = errors.Join(err, workerErr)
 	}()
 

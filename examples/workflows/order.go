@@ -7,19 +7,26 @@ import (
 	"github.com/arekbartnik/nats-workflows/engine"
 )
 
+type FraudScore string
+
+const (
+	FraudLow  FraudScore = "low"
+	FraudHigh FraudScore = "high"
+)
+
 type OrderState struct {
-	Order       Order  `json:"order"`
-	Reservation string `json:"reservation,omitempty"`
-	Fraud       string `json:"fraud,omitempty"` // low | high
-	FraudReview string `json:"fraud_review,omitempty"`
-	Charge      string `json:"charge,omitempty"`
-	Invoice     string `json:"invoice,omitempty"`
-	Label       string `json:"label,omitempty"`
-	Warehouse   string `json:"warehouse,omitempty"`
-	Picked      string `json:"picked,omitempty"`
-	Email       string `json:"email,omitempty"`
-	ReviewReq   string `json:"review_request,omitempty"`
-	Result      string `json:"result,omitempty"`
+	Order       Order      `json:"order"`
+	Reservation string     `json:"reservation,omitempty"`
+	Fraud       FraudScore `json:"fraud,omitempty"`
+	FraudReview string     `json:"fraud_review,omitempty"`
+	Charge      string     `json:"charge,omitempty"`
+	Invoice     string     `json:"invoice,omitempty"`
+	Label       string     `json:"label,omitempty"`
+	Warehouse   string     `json:"warehouse,omitempty"`
+	Picked      string     `json:"picked,omitempty"`
+	Email       string     `json:"email,omitempty"`
+	ReviewReq   string     `json:"review_request,omitempty"`
+	Result      string     `json:"result,omitempty"`
 }
 
 // Amounts use whole currency units in this demo.
@@ -29,9 +36,6 @@ type Order struct {
 	Amount int    `json:"amount"`
 }
 
-// External calls are simulated. Real integrations need stable idempotency
-// keys because a crash can redeliver a Step after its external effect.
-// Separate Hooks prevent late approvals from reaching a later wait.
 func OrderPipeline() engine.Workflow {
 	return engine.Workflow{
 		Name: "order",
@@ -70,15 +74,15 @@ func reserveInventory(ctx context.Context, run *engine.Run, s *OrderState) error
 }
 
 func fraudScore(ctx context.Context, run *engine.Run, s *OrderState) error {
-	s.Fraud = "low"
+	s.Fraud = FraudLow
 	if s.Order.Amount >= 500 {
-		s.Fraud = "high"
+		s.Fraud = FraudHigh
 	}
 	return nil
 }
 
 func fraudOK(ctx context.Context, run *engine.Run, s *OrderState) error {
-	if s.Fraud == "low" {
+	if s.Fraud == FraudLow {
 		s.FraudReview = "auto-approved (low score)"
 		return nil
 	}
@@ -98,7 +102,6 @@ func fraudOK(ctx context.Context, run *engine.Run, s *OrderState) error {
 }
 
 func chargePayment(ctx context.Context, run *engine.Run, s *OrderState) error {
-	// Use run.ID as the payment idempotency key to prevent duplicate charges.
 	s.Charge = "ch-" + run.ID[:8]
 	return nil
 }
@@ -119,9 +122,6 @@ func prepareWarehouse(ctx context.Context, run *engine.Run, s *OrderState) error
 }
 
 func picked(ctx context.Context, run *engine.Run, s *OrderState) error {
-	// Register before notification so an immediate warehouse callback can
-	// submit using this token. A real notification uses run.ID as its
-	// idempotency key because this Step may execute more than once.
 	if _, err := run.RegisterHook(ctx, "confirm-picked", ""); err != nil {
 		return err
 	}

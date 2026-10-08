@@ -92,7 +92,6 @@ func TestHookWinnerAndLaterWait(t *testing.T) {
 	if r.Step != 1 || r.HookWaits[0].Consumed != winner.SubmissionID {
 		t.Fatalf("next wait: %+v", r)
 	}
-	// Old generations remain stale even if JetStream's dedup window has elapsed.
 	stale, _ := json.Marshal(engine.StepMsg{RunID: id, Step: 1, Execution: "old-wakeup"})
 	js.Publish(ctx, "wf.step."+id, stale)
 	if _, err = e.Resume(ctx, id, submission(token, "late")); !errors.Is(err, engine.ErrHookConflict) {
@@ -204,7 +203,6 @@ func TestHookRegistrationRecoveryAndTokenConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	kv, _ := js.KeyValue(ctx, "wf_runs")
-	// Crash after registration intent, before token ownership or Park.
 	r := engine.Run{ID: "interrupted", Workflow: wf.Name, Status: engine.StatusRunning, Execution: "initial", HookWaits: []engine.HookWait{{Name: "answer", Token: "shared", Step: 0, Contract: hookContract.ID}}}
 	data, _ := json.Marshal(r)
 	kv.Create(ctx, r.ID, data)
@@ -217,7 +215,6 @@ func TestHookRegistrationRecoveryAndTokenConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Competing owner cannot expose or submit to the reserved token.
 	other := wait(t, e, id)
 	if other.Status != engine.StatusFailed {
 		t.Fatal(other.Status)
@@ -251,7 +248,6 @@ func TestHookAcceptedOfflineAndCleanup(t *testing.T) {
 	token := r.HookWaits[0].Token
 	stop()
 	<-done
-	// Reject step publication after acceptance, then restart an executor.
 	stream, _ := js.Stream(ctx, "WF_STEPS")
 	info, _ := stream.Info(ctx)
 	config := info.Config
@@ -264,7 +260,7 @@ func TestHookAcceptedOfflineAndCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	h, err := e.GetHook(ctx, token)
-	if err != nil || h.Status != "accepted" {
+	if err != nil || h.Status != engine.HookAccepted {
 		t.Fatalf("lost input: %+v %v", h, err)
 	}
 	replacement, err := engine.New(ctx, nc, slog.New(slog.NewTextHandler(io.Discard, nil)), cfg, wf)
@@ -280,7 +276,6 @@ func TestHookAcceptedOfflineAndCleanup(t *testing.T) {
 	if err != nil || *again != *receipt {
 		t.Fatal(err)
 	}
-	// Crash after terminal Run deletion and before stripping its Hook.
 	kv, _ := js.KeyValue(ctx, "wf_runs")
 	entry, _ := kv.Get(ctx, id)
 	if err = kv.Purge(ctx, id, jetstream.LastRevision(entry.Revision())); err != nil {
@@ -291,7 +286,7 @@ func TestHookAcceptedOfflineAndCleanup(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if h.Status == "gone" {
+		if h.Status == engine.HookGone {
 			break
 		}
 		select {

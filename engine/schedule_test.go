@@ -109,7 +109,6 @@ func TestScheduleRecoveryAndRetention(t *testing.T) {
 		t.Fatal(err)
 	}
 	kv, _ := js.KeyValue(ctx, "wf_runs")
-	// Simulate a crash after saving intent but before publishing any schedule.
 	at := time.Now().Add(-time.Hour)
 	data, _ := json.Marshal(engine.Run{ID: "missed", Workflow: wf.Name, Status: engine.StatusScheduled, StartAt: &at})
 	if _, err := kv.Create(ctx, "missed", data); err != nil {
@@ -196,8 +195,6 @@ func TestStartClaimRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 	kv, _ := js.KeyValue(ctx, "wf_runs")
-	// A prior starter saved running, then crashed before enqueue. Its durable
-	// start delivery remains available to the replacement engine.
 	run := engine.Run{ID: "claimed", Workflow: wf.Name, Status: engine.StatusRunning, StartGeneration: 123}
 	data, _ := json.Marshal(run)
 	if _, err := kv.Create(ctx, run.ID, data); err != nil {
@@ -262,7 +259,6 @@ func TestNativeScheduleWithoutExecutor(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// No Serve or maintenance is running: only NATS can deliver this start.
 	for {
 		info, err := consumer.Info(ctx)
 		if err != nil {

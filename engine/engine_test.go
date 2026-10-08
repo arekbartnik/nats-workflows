@@ -209,7 +209,7 @@ func TestErrParkKeepsState(t *testing.T) {
 		Steps: []engine.Step{{
 			Name: "needs-input", Input: engine.HookType[decisionInput]("decision-v1", nil),
 			Run: engine.Typed(func(ctx context.Context, run *engine.Run, s *tState) error {
-				s.Kept = "kept" // must survive the park
+				s.Kept = "kept"
 				if _, err := engine.HookInput[decisionInput](ctx, run, "decision", ""); err != nil {
 					return err
 				}
@@ -325,8 +325,6 @@ func TestStaleReplay(t *testing.T) {
 	}
 	wait(t, eng, id)
 
-	// Replay step 0 as a redelivery would deliver it (no Msg-Id, so dedup
-	// can't swallow it). The stale-step guard must ack it without re-running.
 	data, _ := json.Marshal(engine.StepMsg{RunID: id, Step: 0})
 	if _, err := js.Publish(ctx, "wf.step."+id, data); err != nil {
 		t.Fatalf("publishing stale message: %v", err)
@@ -346,10 +344,6 @@ func TestStaleReplay(t *testing.T) {
 }
 
 func TestCrashRecovery(t *testing.T) {
-	// A recovery window: putRun wrote status "running", then the
-	// process died before enqueue — the run is mid-flight with no message.
-	// Reproduce that state in KV, then replay step 0 as a redelivery: the
-	// stale-step guard must re-enqueue the current step and complete the run.
 	eng, js := newTestEngine(t, engine.Workflow{
 		Name: "wf",
 		Steps: []engine.Step{
@@ -419,8 +413,6 @@ func TestWaitTerminal(t *testing.T) {
 	}
 	wait(t, eng, id)
 
-	// An already-terminal run returns from Wait immediately: the watcher
-	// delivers the current value first.
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	run, err := eng.Wait(ctx, id)

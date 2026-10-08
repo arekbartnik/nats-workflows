@@ -10,10 +10,8 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
-// Join the local server to avoid opening the same store in two processes.
 const defaultNATSURL = "nats://127.0.0.1:4222"
 
-// An explicit NATS_URL must fail rather than fall back to another store.
 func startNATS(log *slog.Logger, listen bool) (*nats.Conn, func(), error) {
 	url, explicit := os.Getenv("NATS_URL"), true
 	if url == "" {

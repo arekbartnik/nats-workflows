@@ -34,8 +34,6 @@ func Ask() engine.Workflow {
 	}
 }
 
-// A crash after the paid call but before persistence can repeat the charge.
-// This demo accepts that risk.
 func askAI(ctx context.Context, run *engine.Run, s *AskState) error {
 	key := os.Getenv("OPENROUTER_API_KEY")
 	if key == "" {

@@ -77,20 +77,18 @@ type Workflow struct {
 }
 
 type Run struct {
-	ID        string     `json:"id"`
-	Workflow  string     `json:"workflow"`
-	Status    Status     `json:"status"`
-	Step      int        `json:"step"`
-	Error     string     `json:"error,omitempty"`
-	StartAt   *time.Time `json:"start_at,omitempty"`
-	ExpiresAt *time.Time `json:"expires_at,omitempty"`
-	// StartGeneration identifies the scheduling revision that claimed execution.
+	ID              string          `json:"id"`
+	Workflow        string          `json:"workflow"`
+	Status          Status          `json:"status"`
+	Step            int             `json:"step"`
+	Error           string          `json:"error,omitempty"`
+	StartAt         *time.Time      `json:"start_at,omitempty"`
+	ExpiresAt       *time.Time      `json:"expires_at,omitempty"`
 	StartGeneration uint64          `json:"start_generation,omitempty"`
 	State           json.RawMessage `json:"state,omitempty"`
 
 	// The KV timestamp, populated on read rather than stored in the Run JSON.
-	Updated time.Time `json:"-"`
-	// Used for compare-and-swap, independently of execution identity.
+	Updated   time.Time `json:"-"`
 	rev       uint64
 	Execution string     `json:"execution,omitempty"`
 	Hooks     []*Hook    `json:"-"`
@@ -293,7 +291,6 @@ func (e *Engine) createRun(ctx context.Context, wf string, initial any, at *time
 		return "", err
 	}
 	if at != nil {
-		// The durable intent is accepted. Serve repairs a failed publication.
 		if err := e.publishSchedule(ctx, run); err != nil {
 			e.log.Warn("schedule publication deferred", "run", run.ID, "err", err)
 		}
@@ -345,9 +342,6 @@ func (e *Engine) Serve(ctx context.Context) error {
 		for _, consumer := range consumers {
 			consumer.Stop()
 		}
-		// A subscription can become invalid before its callback returns.
-		// Wait for our handlers directly; later callbacks see cancelled ctx
-		// and cannot enter engine or application code.
 		callbacks.Lock()
 		callbacks.Unlock()
 		for _, consumer := range consumers {
@@ -391,8 +385,7 @@ func (e *Engine) Serve(ctx context.Context) error {
 }
 
 // executeSteps pulls a Step only when a slot is free. A prefetched delivery
-// waiting for a slot would outlive its ack wait and run twice. It returns
-// when ctx ends or the consumer is gone.
+// waiting for a slot would outlive its ack wait and run twice.
 func (e *Engine) executeSteps(ctx context.Context, callbacks *sync.RWMutex) {
 	slots := make(chan struct{}, e.concurrency)
 	for {
@@ -429,7 +422,6 @@ func (e *Engine) executeSteps(ctx context.Context, callbacks *sync.RWMutex) {
 	}
 }
 
-// nextStep long-polls for one delivery; nil without an error means none came.
 func (e *Engine) nextStep(ctx context.Context) (jetstream.Msg, error) {
 	pollCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
@@ -446,9 +438,6 @@ func (e *Engine) nextStep(ctx context.Context) (jetstream.Msg, error) {
 	return nil, nil
 }
 
-// Persist State, publish the next Step, then ack. A crash between these
-// operations leaves a delivery that can repair the interrupted transition.
-// See docs/adr/0001.
 func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	var sm StepMsg
 	if err := json.Unmarshal(msg.Data(), &sm); err != nil {
@@ -472,9 +461,6 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 		return
 	}
 
-	// Redelivery of a step that already completed. If the run is still going,
-	// re-enqueue its current step in case the crash happened between putRun and
-	// enqueue — dedup makes this a no-op when the message already exists.
 	if run.Step > sm.Step || run.Status.Terminal() {
 		if run.Status == StatusRunning {
 			e.enqueue(ctx, run, run.Step)
@@ -530,8 +516,6 @@ func (e *Engine) handle(ctx context.Context, msg jetstream.Msg) {
 	e.log.Info("step done", "run", run.ID, "step", sm.Step, "name", step.Name, "status", run.Status)
 }
 
-// runStep keeps the delivery in progress while the Step runs, so a Step may
-// outlast the ack wait up to its timeout.
 func (e *Engine) runStep(ctx context.Context, msg jetstream.Msg, step Step, run *Run) error {
 	stepCtx, cancel := context.WithTimeout(ctx, cmp.Or(step.Timeout, e.stepTimeout))
 	defer cancel()
@@ -555,9 +539,6 @@ func (e *Engine) runStep(ctx context.Context, msg jetstream.Msg, step Step, run 
 }
 
 func (e *Engine) fail(ctx context.Context, msg jetstream.Msg, run *Run, err error) {
-	// NumDelivered is native server metadata; on the last attempt we record the
-	// failure ourselves rather than relying on the MAX_DELIVERIES advisory,
-	// which is fire-and-forget and would leave the run stuck if missed.
 	md, mdErr := msg.Metadata()
 	if !errors.Is(err, ErrTerminal) && mdErr == nil && md.NumDelivered < uint64(e.maxDeliver) {
 		e.log.Warn("step failed, will retry", "run", run.ID, "step", run.Step, "attempt", md.NumDelivered, "err", err)
@@ -574,8 +555,6 @@ func (e *Engine) fail(ctx context.Context, msg jetstream.Msg, run *Run, err erro
 	e.log.Error("run failed", "run", run.ID, "step", run.Step, "err", err)
 }
 
-// enqueue republishes the persisted execution identity. Dedup reduces copies;
-// the Step and execution checks reject stale deliveries beyond its window.
 func (e *Engine) enqueue(ctx context.Context, run *Run, step int) error {
 	data, err := json.Marshal(StepMsg{RunID: run.ID, Step: step, Execution: run.Execution})
 	if err != nil {
@@ -703,7 +682,8 @@ func (e *Engine) putRun(ctx context.Context, run *Run) error {
 }
 
 // With no statuses, Wait uses terminal statuses. The watcher sends the
-// current value first, so an already-terminal Run returns immediately.
+// current value first, so an already-terminal Run returns immediately. When ctx
+// ends first, Wait returns the last observed Run and an error wrapping ctx.Err().
 func (e *Engine) Wait(ctx context.Context, runID string, statuses ...Status) (*Run, error) {
 	reached := func(s Status) bool { return s.Terminal() }
 	if len(statuses) > 0 {
@@ -718,7 +698,7 @@ func (e *Engine) Wait(ctx context.Context, runID string, statuses ...Status) (*R
 	for {
 		select {
 		case <-ctx.Done():
-			return last, errors.New("timed out waiting for run")
+			return last, fmt.Errorf("timed out waiting for run: %w", ctx.Err())
 		case entry := <-w.Updates():
 			if entry == nil { // end of initial values
 				if last == nil {

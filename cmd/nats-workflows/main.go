@@ -22,7 +22,6 @@ import (
 	"github.com/arekbartnik/nats-workflows/examples/workflows"
 )
 
-// Keep os.Exit outside realMain so deferred NATS cleanup runs on errors.
 func main() {
 	os.Exit(realMain())
 }
@@ -242,7 +241,7 @@ func approveRun(ctx context.Context, eng *engine.Engine, runID string, args []st
 		decision = args[0]
 	}
 	input := workflows.DecisionInput{Decision: decision}
-	if err := submitCLI(ctx, eng, runID, input, args); err != nil {
+	if err := submitCLI(ctx, eng, runID, input, submissionArg(args)); err != nil {
 		return err
 	}
 	return followRun(ctx, eng, runID)
@@ -335,7 +334,7 @@ func runChoose(ctx context.Context, eng *engine.Engine, args []string) (*engine.
 		return nil, fmt.Errorf("choice out of range; run %s stays parked", runID)
 	}
 	input := workflows.ChoiceInput{Choice: choice}
-	if err := submitCLI(ctx, eng, runID, input, args); err != nil {
+	if err := submitCLI(ctx, eng, runID, input, submissionArg(args)); err != nil {
 		return nil, err
 	}
 
@@ -344,9 +343,14 @@ func runChoose(ctx context.Context, eng *engine.Engine, args []string) (*engine.
 	return eng.Wait(waitCtx2, runID)
 }
 
-// Resolve the Hook once per user action. Every transport retry uses this same
-// token, ID and payload. A final argument supplies an explicit submission ID.
-func submitCLI(ctx context.Context, eng *engine.Engine, runID string, input any, args []string) error {
+func submissionArg(args []string) string {
+	if len(args) > 1 {
+		return args[1]
+	}
+	return uuid.NewString()
+}
+
+func submitCLI(ctx context.Context, eng *engine.Engine, runID string, input any, submissionID string) error {
 	run, err := eng.GetRun(ctx, runID)
 	if err != nil {
 		return err
@@ -360,15 +364,11 @@ func submitCLI(ctx context.Context, eng *engine.Engine, runID string, input any,
 	if token == "" {
 		return fmt.Errorf("run has no outstanding hook")
 	}
-	id := uuid.NewString()
-	if len(args) > 1 {
-		id = args[1]
-	}
 	payload, err := json.Marshal(input)
 	if err != nil {
 		return err
 	}
-	submission := engine.Submission{Token: token, SubmissionID: id, Payload: payload}
+	submission := engine.Submission{Token: token, SubmissionID: submissionID, Payload: payload}
 	for attempt := 0; attempt < 3; attempt++ {
 		receipt, err := eng.Resume(ctx, runID, submission)
 		if err == nil {

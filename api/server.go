@@ -1,4 +1,3 @@
-// Handler changes require corresponding updates to the embedded OpenAPI spec.
 package api
 
 import (
@@ -25,7 +24,6 @@ var openapiYAML []byte
 //go:embed docs.html
 var docsHTML []byte
 
-// Clients can resume polling after timeout; Runs outlive individual requests.
 const (
 	waitDefault = 30 * time.Second
 	waitMax     = 5 * time.Minute
@@ -210,7 +208,6 @@ func (s *Server) runHistory(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, infos)
 }
 
-// Both routes return acceptance receipts, independently of Step completion.
 func (s *Server) resumeRun(w http.ResponseWriter, r *http.Request) {
 	s.acceptHook(w, r, true)
 }
@@ -282,8 +279,6 @@ func (s *Server) rescheduleRun(w http.ResponseWriter, r *http.Request) {
 	s.respondRun(w, r, id)
 }
 
-// Timeout returns the latest snapshot with HTTP 200; callers inspect its
-// status to decide whether to poll again.
 func (s *Server) waitRun(w http.ResponseWriter, r *http.Request) {
 	timeout := waitDefault
 	if q := r.URL.Query().Get("timeout"); q != "" {
@@ -298,12 +293,11 @@ func (s *Server) waitRun(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	id := r.PathValue("id")
 	run, err := s.eng.Wait(ctx, id, engine.StatusParked, engine.StatusDone, engine.StatusFailed, engine.StatusCancelled)
-	if err != nil && run == nil {
-		// Not a timeout with a snapshot in hand: report the run's real state.
-		s.respondRun(w, r, id)
+	if err == nil || run != nil && errors.Is(err, context.DeadlineExceeded) {
+		writeJSON(w, http.StatusOK, s.runInfo(run))
 		return
 	}
-	writeJSON(w, http.StatusOK, s.runInfo(run))
+	s.respondRun(w, r, id)
 }
 
 func (s *Server) respondRun(w http.ResponseWriter, r *http.Request, id string) {

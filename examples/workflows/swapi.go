@@ -70,13 +70,10 @@ func fetchPeople(ctx context.Context, run *engine.Run, s *SwapiState) error {
 	return nil
 }
 
-// Redelivery may pick a different person; this Step has no external effects.
 func randomPerson(ctx context.Context, run *engine.Run, s *SwapiState) error {
 	return fetchPerson(ctx, s.People[rand.IntN(len(s.People))], s)
 }
 
-// Out-of-range choices fail the Step and remain accepted on Retry.
-// The CLI checks the range before submission.
 func chosenPerson(ctx context.Context, run *engine.Run, s *SwapiState) error {
 	input, err := engine.HookInput[ChoiceInput](ctx, run, "chosen-person", "")
 	if err != nil {

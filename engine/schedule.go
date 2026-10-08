@@ -121,8 +121,6 @@ func (e *Engine) publishSchedule(ctx context.Context, run *Run) error {
 	return err
 }
 
-// The start message stays unacked until the first step is durably queued.
-// A redelivery can therefore repair a crash after the CAS that starts the Run.
 func (e *Engine) handleStart(ctx context.Context, msg jetstream.Msg) {
 	var start startMessage
 	if json.Unmarshal(msg.Data(), &start) != nil {
@@ -159,8 +157,6 @@ func (e *Engine) handleStart(ctx context.Context, msg jetstream.Msg) {
 	msg.Ack()
 }
 
-// KV is the durable intent. Reconcile missed publications and purge terminal
-// Runs with revision checks so a concurrent Retry cannot lose its state.
 func (e *Engine) maintainRuns(ctx context.Context) {
 	runs, err := e.ListRuns(ctx)
 	if err != nil {
@@ -189,8 +185,6 @@ func (e *Engine) maintainRuns(ctx context.Context) {
 		}
 	}
 	e.cleanHooks(ctx)
-	// Reconcile obsolete schedule records too: a publisher can crash or race
-	// cancellation after reading an older Run revision.
 	// Info mutates the client's cached stream metadata. Use a separate handle
 	// so concurrent schedule lookups do not race that mutation in nats.go.
 	snapshot, err := e.js.Stream(ctx, e.names.schedules)

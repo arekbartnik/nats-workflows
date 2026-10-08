@@ -41,7 +41,6 @@ func TestEmbeddedLeavesSignalsToHost(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("host did not receive SIGTERM")
 	}
-	// Give an accidentally installed NATS signal handler time to run as well.
 	time.Sleep(100 * time.Millisecond)
 	if err := srv.Conn().Flush(); err != nil {
 		t.Fatalf("signal shut down the host's server: %v", err)

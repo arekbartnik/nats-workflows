@@ -83,13 +83,22 @@ type Receipt struct {
 	AcceptedAt   time.Time `json:"accepted_at"`
 }
 
+type HookStatus string
+
+const (
+	HookPending  HookStatus = "pending"
+	HookAccepted HookStatus = "accepted"
+	HookConsumed HookStatus = "consumed"
+	HookGone     HookStatus = "gone"
+)
+
 type Hook struct {
 	Name     string          `json:"name"`
 	Token    string          `json:"token"`
 	RunID    string          `json:"run_id"`
 	Step     int             `json:"step"`
 	Contract string          `json:"contract"`
-	Status   string          `json:"status"` // pending, accepted, consumed, gone
+	Status   HookStatus      `json:"status"`
 	Payload  json.RawMessage `json:"payload,omitempty"`
 	Receipt  *Receipt        `json:"receipt,omitempty"`
 	rev      uint64
@@ -194,7 +203,6 @@ func (r *Run) RegisterHook(ctx context.Context, name, token string) (*Hook, erro
 		token = uuid.NewString()
 	}
 	w := HookWait{Name: name, Token: token, Step: r.Step, Contract: contract.ID}
-	// Registration must not commit the Step's in-flight State.
 	stored, err := e.GetRun(ctx, r.ID)
 	if err != nil {
 		return nil, err
@@ -214,7 +222,7 @@ func (r *Run) RegisterHook(ctx context.Context, name, token string) (*Hook, erro
 func (e *Engine) reserveHook(ctx context.Context, r *Run, w HookWait) (*Hook, error) {
 	h, err := e.GetHook(ctx, w.Token)
 	if errors.Is(err, jetstream.ErrKeyNotFound) {
-		h = &Hook{Name: w.Name, Token: w.Token, RunID: r.ID, Step: w.Step, Contract: w.Contract, Status: "pending"}
+		h = &Hook{Name: w.Name, Token: w.Token, RunID: r.ID, Step: w.Step, Contract: w.Contract, Status: HookPending}
 		if err = e.saveHook(ctx, h); err == nil {
 			return h, nil
 		}
@@ -229,7 +237,7 @@ func (e *Engine) reserveHook(ctx context.Context, r *Run, w HookWait) (*Hook, er
 	if h.RunID != r.ID || h.Name != w.Name || h.Step != w.Step || h.Contract != w.Contract {
 		return nil, ErrHookConflict
 	}
-	if h.Status == "gone" {
+	if h.Status == HookGone {
 		return nil, ErrHookGone
 	}
 	return h, nil
@@ -274,7 +282,7 @@ func (e *Engine) Submit(ctx context.Context, s Submission) (*Receipt, error) {
 		if err != nil {
 			return nil, err
 		}
-		if h.Status == "gone" {
+		if h.Status == HookGone {
 			return nil, ErrHookGone
 		}
 		if h.Receipt != nil {
@@ -312,13 +320,12 @@ func (e *Engine) Submit(ctx context.Context, s Submission) (*Receipt, error) {
 		}
 		h.Payload = normalized
 		h.Receipt = &Receipt{Token: h.Token, SubmissionID: s.SubmissionID, AcceptedAt: time.Now().UTC()}
-		h.Status = "accepted"
+		h.Status = HookAccepted
 		if err = e.saveHook(ctx, h); errors.Is(err, jetstream.ErrKeyExists) {
 			continue
 		} else if err != nil {
 			return nil, err
 		}
-		// Best effort acceleration. The Hook remains delivery intent after a crash.
 		e.reconcileRunHooks(ctx, r)
 		return h.Receipt, nil
 	}
@@ -353,7 +360,7 @@ func equivalentJSON(a, b []byte) bool {
 			if !ok {
 				return false
 			}
-			return numberValue(string(x)) == numberValue(string(y))
+			return canonicalDecimal(string(x)) == canonicalDecimal(string(y))
 		case map[string]any:
 			y, ok := b.(map[string]any)
 			if !ok || len(x) != len(y) {
@@ -425,8 +432,8 @@ func (e *Engine) reconcileRunHooks(ctx context.Context, r *Run) {
 			continue
 		}
 		if w.Consumed != "" && h.Receipt != nil && h.Receipt.SubmissionID == w.Consumed {
-			if h.Status != "consumed" {
-				h.Status = "consumed"
+			if h.Status != HookConsumed {
+				h.Status = HookConsumed
 				_ = e.saveHook(ctx, h)
 			}
 		} else if h.Receipt != nil && r.Status == StatusParked && w.Step == r.Step {
@@ -442,9 +449,6 @@ func (e *Engine) reconcileRunHooks(ctx context.Context, r *Run) {
 	}
 }
 
-// Run deletion is the cleanup fence. A concurrent Retry either wins its CAS
-// first or cannot revive the deleted Run. Scan reservations too to recover a
-// crash between deletion and payload cleanup.
 func (e *Engine) cleanHooks(ctx context.Context) {
 	keys, err := e.hooks.ListKeys(ctx)
 	if err != nil {
@@ -456,22 +460,21 @@ func (e *Engine) cleanHooks(ctx context.Context) {
 			continue
 		}
 		var h Hook
-		if json.Unmarshal(entry.Value(), &h) != nil || h.Status == "gone" {
+		if json.Unmarshal(entry.Value(), &h) != nil || h.Status == HookGone {
 			continue
 		}
 		h.rev = entry.Revision()
 		if _, err = e.GetRun(ctx, h.RunID); !errors.Is(err, jetstream.ErrKeyNotFound) {
 			continue
 		}
-		h.Status = "gone"
+		h.Status = HookGone
 		h.Payload = nil
 		h.Receipt = nil
 		_ = e.saveHook(ctx, &h)
 	}
 }
 
-// Compare decimal values without float rounding or allocating 10^exponent.
-func numberValue(s string) string {
+func canonicalDecimal(s string) string {
 	sign := ""
 	if strings.HasPrefix(s, "-") {
 		sign = "-"

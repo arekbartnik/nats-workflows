@@ -78,14 +78,14 @@ func TestHookCleanupRacesRetry(t *testing.T) {
 			if err != nil || r.Status != StatusRunning || r.ExpiresAt != nil {
 				t.Fatalf("retried Run lost: %+v %v", r, err)
 			}
-			if h.Receipt == nil || h.Status == "gone" || len(h.Payload) == 0 {
+			if h.Receipt == nil || h.Status == HookGone || len(h.Payload) == 0 {
 				t.Fatal("cleanup stripped retried input")
 			}
 		} else {
 			if _, err = e.GetRun(ctx, id); !errors.Is(err, jetstream.ErrKeyNotFound) {
 				t.Fatalf("neither retry nor cleanup won: %v", err)
 			}
-			if h.Status != "gone" || h.Receipt != nil || len(h.Payload) != 0 {
+			if h.Status != HookGone || h.Receipt != nil || len(h.Payload) != 0 {
 				t.Fatalf("cleanup lost: %+v", h)
 			}
 		}
@@ -120,7 +120,6 @@ func TestConcurrentHookRegistration(t *testing.T) {
 	if _, err = r.RegisterHook(ctx, "second", ""); !errors.Is(err, ErrHookConflict) {
 		t.Fatal(err)
 	}
-	// Registering a different contract under the same name cannot reinterpret input.
 	e.workflows["protocol"].Steps[0].Input = HookType[map[string]any]("v2", nil)
 	if _, err = r.RegisterHook(ctx, "wait", ""); !errors.Is(err, ErrHookConflict) {
 		t.Fatal(err)
@@ -141,7 +140,6 @@ func TestHookConsumptionRecoveryAndFullStoreCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Reproduce a successful Step CAS before the Hook status update.
 	r, _ = e.GetRun(ctx, id)
 	r.HookWaits[0].Consumed = "one"
 	r.Step = 1
@@ -151,7 +149,7 @@ func TestHookConsumptionRecoveryAndFullStoreCleanup(t *testing.T) {
 	}
 	e.reconcileRunHooks(ctx, r)
 	h, _ = e.GetHook(ctx, h.Token)
-	if h.Status != "consumed" {
+	if h.Status != HookConsumed {
 		t.Fatal(h.Status)
 	}
 	stream, _ := e.js.Stream(ctx, "KV_wf_hooks")
@@ -166,10 +164,9 @@ func TestHookConsumptionRecoveryAndFullStoreCleanup(t *testing.T) {
 	}
 	e.cleanHooks(ctx)
 	h, _ = e.GetHook(ctx, h.Token)
-	if h.Status != "gone" {
+	if h.Status != HookGone {
 		t.Fatalf("full store prevented shrinking cleanup: %+v", h)
 	}
-	// The reservation remains even when another Run requests this token.
 	id, _ = e.Start(ctx, "protocol", nil)
 	r, _ = e.GetRun(ctx, id)
 	r.engine = e
@@ -195,7 +192,6 @@ func TestStaleWakeupAfterDedupWindow(t *testing.T) {
 	id, _ := e.Start(ctx, "protocol", nil)
 	r, _ := e.GetRun(ctx, id)
 	oldExecution := r.Execution
-	// Consume the initial delivery as though it parked, then commit a new wakeup.
 	msg, err := e.cons.Next(jetstream.FetchMaxWait(time.Second))
 	if err != nil {
 		t.Fatal(err)
