@@ -157,19 +157,28 @@ func (e *Engine) handleStart(ctx context.Context, msg jetstream.Msg) {
 	msg.Ack()
 }
 
-// maintained is Serve's copy of a Run, kept current by the Run watch.
-type maintained struct {
-	run *Run
-	// Nothing is left to repair until the Run or one of its Hooks changes.
-	settled bool
-	// The Run was removed and its Hooks may still hold input.
-	gone bool
+type upkeep int
+
+const (
+	unsettled upkeep = iota
+	settled
+	hookCleanupPending
+)
+
+type watchedRun struct {
+	stored *Run
+	upkeep upkeep
 }
 
-func (e *Engine) observeRun(runs map[string]*maintained, entry jetstream.KeyValueEntry) {
+func (w *watchedRun) reconcileDue(now time.Time) bool {
+	startDue := w.stored.Status == StatusScheduled && !w.stored.StartAt.After(now)
+	return w.upkeep == unsettled || startDue
+}
+
+func (e *Engine) observeRun(runs map[string]*watchedRun, entry jetstream.KeyValueEntry) {
 	if entry.Operation() != jetstream.KeyValuePut {
-		if m := runs[entry.Key()]; m != nil {
-			m.gone = true
+		if w := runs[entry.Key()]; w != nil {
+			w.upkeep = hookCleanupPending
 		}
 		return
 	}
@@ -179,55 +188,48 @@ func (e *Engine) observeRun(runs map[string]*maintained, entry jetstream.KeyValu
 		delete(runs, entry.Key())
 		return
 	}
-	runs[entry.Key()] = &maintained{run: run}
+	runs[entry.Key()] = &watchedRun{stored: run}
 }
 
-func observeHook(runs map[string]*maintained, entry jetstream.KeyValueEntry) {
+func observeHook(runs map[string]*watchedRun, entry jetstream.KeyValueEntry) {
 	var h Hook
 	if entry.Operation() != jetstream.KeyValuePut || json.Unmarshal(entry.Value(), &h) != nil {
 		return
 	}
-	if m := runs[h.RunID]; m != nil {
-		m.settled = false
+	if w := runs[h.RunID]; w != nil && w.upkeep == settled {
+		w.upkeep = unsettled
 	}
 }
 
-// maintainRuns repairs what interruptions left undone. A settled Run costs
-// no request, so a pass is as large as the Runs that changed, are running, or
-// are due.
-func (e *Engine) maintainRuns(ctx context.Context, runs map[string]*maintained) {
+func (e *Engine) maintainRuns(ctx context.Context, runs map[string]*watchedRun) {
 	now := time.Now()
-	for id, m := range runs {
-		// A repair changes its Run. The watch delivers what was stored.
-		run := *m.run
-		if !m.gone && run.Status.Terminal() {
-			expiry := run.ExpiresAt
+	for id, w := range runs {
+		if w.upkeep != hookCleanupPending && w.stored.Status.Terminal() {
+			expiry := w.stored.ExpiresAt
 			if expiry == nil {
-				legacy := run.Updated.Add(7 * 24 * time.Hour)
+				legacy := w.stored.Updated.Add(7 * 24 * time.Hour)
 				expiry = &legacy
 			}
 			if !expiry.After(now) {
-				if err := e.kv.Purge(ctx, run.ID, jetstream.LastRevision(run.rev)); err != nil {
-					e.log.Warn("expiring run", "run", run.ID, "err", err)
+				if err := e.kv.Purge(ctx, w.stored.ID, jetstream.LastRevision(w.stored.rev)); err != nil {
+					e.log.Warn("expiring run", "run", w.stored.ID, "err", err)
 					continue
 				}
-				m.gone = true
+				w.upkeep = hookCleanupPending
 			}
 		}
-		if m.gone {
-			if e.cleanRunHooks(ctx, &run) {
+		switch {
+		case w.upkeep == hookCleanupPending:
+			if e.stripHooksOfRemovedRun(ctx, w.stored) == nil {
 				delete(runs, id)
 			}
-			continue
-		}
-		if m.settled && (run.Status != StatusScheduled || run.StartAt.After(now)) {
-			continue
-		}
-		m.settled = e.reconcileRunHooks(ctx, &run)
-		if run.Status == StatusScheduled {
-			if err := e.publishSchedule(ctx, &run); err != nil {
-				e.log.Warn("repairing schedule", "run", run.ID, "err", err)
-				m.settled = false
+		case w.reconcileDue(now):
+			w.upkeep = e.reconcileRun(ctx, *w.stored)
+			if w.stored.Status == StatusScheduled {
+				if err := e.publishSchedule(ctx, w.stored); err != nil {
+					e.log.Warn("repairing schedule", "run", w.stored.ID, "err", err)
+					w.upkeep = unsettled
+				}
 			}
 		}
 	}
@@ -246,7 +248,7 @@ func (e *Engine) maintainRuns(ctx context.Context, runs map[string]*maintained) 
 		if len(parts) != 4 {
 			continue
 		}
-		if m := runs[parts[2]]; m != nil && !m.gone && m.run.Status == StatusScheduled && e.scheduleSubject(m.run) == subject {
+		if w := runs[parts[2]]; w != nil && w.upkeep != hookCleanupPending && w.stored.Status == StatusScheduled && e.scheduleSubject(w.stored) == subject {
 			continue
 		}
 		run, err := e.GetRun(ctx, parts[2])

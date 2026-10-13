@@ -66,9 +66,9 @@ func TestHookCleanupRacesRetry(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); retryErr = e.Retry(ctx, id) }()
-		go func() { defer wg.Done(); e.maintainRuns(ctx, map[string]*maintained{id: {run: r}}) }()
+		go func() { defer wg.Done(); e.maintainRuns(ctx, map[string]*watchedRun{id: {stored: r}}) }()
 		wg.Wait()
-		e.cleanHooks(ctx)
+		e.sweepOrphanedHooks(ctx)
 		h, err = e.GetHook(ctx, h.Token)
 		if err != nil {
 			t.Fatal(err)
@@ -147,7 +147,7 @@ func TestHookConsumptionRecoveryAndFullStoreCleanup(t *testing.T) {
 	if err = e.putRun(ctx, r); err != nil {
 		t.Fatal(err)
 	}
-	e.reconcileRunHooks(ctx, r)
+	e.reconcileRun(ctx, *r)
 	h, _ = e.GetHook(ctx, h.Token)
 	if h.Status != HookConsumed {
 		t.Fatal(h.Status)
@@ -162,7 +162,7 @@ func TestHookConsumptionRecoveryAndFullStoreCleanup(t *testing.T) {
 	if err = e.kv.Purge(ctx, id, jetstream.LastRevision(r.rev)); err != nil {
 		t.Fatal(err)
 	}
-	e.cleanHooks(ctx)
+	e.sweepOrphanedHooks(ctx)
 	h, _ = e.GetHook(ctx, h.Token)
 	if h.Status != HookGone {
 		t.Fatalf("full store prevented shrinking cleanup: %+v", h)

@@ -375,8 +375,8 @@ func (e *Engine) Serve(ctx context.Context) error {
 		return unlessCancelled(ctx, err)
 	}
 	defer hookWatch.Stop()
-	e.cleanHooks(ctx)
-	runs := map[string]*maintained{}
+	e.sweepOrphanedHooks(ctx)
+	runs := map[string]*watchedRun{}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -391,7 +391,7 @@ func (e *Engine) Serve(ctx context.Context) error {
 			if !ok {
 				return unlessCancelled(ctx, errors.New("run watch stopped unexpectedly"))
 			}
-			// A nil entry ends the stored Runs. Repair them without waiting for the ticker.
+			// A nil entry ends the stored Runs.
 			if entry == nil {
 				e.maintainRuns(ctx, runs)
 				continue
@@ -410,7 +410,6 @@ func (e *Engine) Serve(ctx context.Context) error {
 	}
 }
 
-// Serve ends without an error once its context is cancelled.
 func unlessCancelled(ctx context.Context, err error) error {
 	if ctx.Err() != nil {
 		return nil

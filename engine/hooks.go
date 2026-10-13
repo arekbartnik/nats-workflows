@@ -326,7 +326,7 @@ func (e *Engine) Submit(ctx context.Context, s Submission) (*Receipt, error) {
 		} else if err != nil {
 			return nil, err
 		}
-		e.reconcileRunHooks(ctx, r)
+		e.reconcileRun(ctx, *r)
 		return h.Receipt, nil
 	}
 }
@@ -425,45 +425,40 @@ func (e *Engine) RunHooks(ctx context.Context, r *Run) ([]*Hook, error) {
 	return hooks, nil
 }
 
-// reconcileRunHooks reports whether the Run needs nothing more until it or
-// one of its Hooks changes.
-func (e *Engine) reconcileRunHooks(ctx context.Context, r *Run) bool {
-	settled := true
-	for _, w := range r.HookWaits {
-		h, err := e.reserveHook(ctx, r, w)
+func (e *Engine) reconcileRun(ctx context.Context, run Run) upkeep {
+	next := settled
+	for _, w := range run.HookWaits {
+		h, err := e.reserveHook(ctx, &run, w)
 		if errors.Is(err, ErrHookConflict) || errors.Is(err, ErrHookGone) {
 			continue
 		}
 		if err != nil {
-			settled = false
+			next = unsettled
 			continue
 		}
 		if w.Consumed != "" && h.Receipt != nil && h.Receipt.SubmissionID == w.Consumed {
 			if h.Status != HookConsumed {
 				h.Status = HookConsumed
 				if e.saveHook(ctx, h) != nil {
-					settled = false
+					next = unsettled
 				}
 			}
-		} else if h.Receipt != nil && r.Status == StatusParked && w.Step == r.Step {
-			r.Status = StatusRunning
-			r.Execution = uuid.NewString()
-			if e.putRun(ctx, r) != nil {
-				return false
+		} else if h.Receipt != nil && run.Status == StatusParked && w.Step == run.Step {
+			run.Status = StatusRunning
+			run.Execution = uuid.NewString()
+			if e.putRun(ctx, &run) != nil {
+				return unsettled
 			}
 		}
 	}
-	if r.Status == StatusRunning {
-		// A running Run is never settled, because only a stored Step message moves it.
-		_ = e.enqueue(ctx, r, r.Step)
-		return false
+	if run.Status == StatusRunning {
+		_ = e.enqueue(ctx, &run, run.Step)
+		return unsettled
 	}
-	return settled
+	return next
 }
 
-// cleanHooks scans every reservation, which recovers a cleanup that was
-// interrupted while no worker was serving.
-func (e *Engine) cleanHooks(ctx context.Context) {
+func (e *Engine) sweepOrphanedHooks(ctx context.Context) {
 	keys, err := e.hooks.ListKeys(ctx)
 	if err != nil {
 		return
@@ -478,28 +473,26 @@ func (e *Engine) cleanHooks(ctx context.Context) {
 			continue
 		}
 		h.rev = entry.Revision()
-		_ = e.cleanHook(ctx, &h)
+		_ = e.stripHookIfOrphaned(ctx, &h)
 	}
 }
 
-// cleanRunHooks reports whether no Hook of the removed Run holds input.
-func (e *Engine) cleanRunHooks(ctx context.Context, r *Run) bool {
-	clean := true
-	for _, w := range r.HookWaits {
+func (e *Engine) stripHooksOfRemovedRun(ctx context.Context, removed *Run) error {
+	var unstripped error
+	for _, w := range removed.HookWaits {
 		h, err := e.GetHook(ctx, w.Token)
 		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			continue
 		}
-		if err != nil || (h.RunID == r.ID && e.cleanHook(ctx, h) != nil) {
-			clean = false
+		if err == nil && h.RunID == removed.ID {
+			err = e.stripHookIfOrphaned(ctx, h)
 		}
+		unstripped = errors.Join(unstripped, err)
 	}
-	return clean
+	return unstripped
 }
 
-// cleanHook strips the Hook's input once its Run is gone and keeps the token
-// reserved.
-func (e *Engine) cleanHook(ctx context.Context, h *Hook) error {
+func (e *Engine) stripHookIfOrphaned(ctx context.Context, h *Hook) error {
 	if h.Status == HookGone {
 		return nil
 	}
