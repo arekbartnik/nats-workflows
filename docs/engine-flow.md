@@ -30,7 +30,7 @@ The receipt means input is durable. Step-stream publication failure after accept
 
 ## Delivery and consumption
 
-`Serve` reconciles Runs every second. It repairs interrupted registrations and publications. When a matching parked wait has input, a Run CAS records running status and a fresh execution identity. Reconciliation republishes that same identity after interruptions.
+`Serve` watches Runs and Hooks and reconciles every second. A pass reads only Runs that changed, had a Hook change, are running, or are due, so finished and waiting Runs cost no request. It repairs interrupted registrations and publications. When a matching parked wait has input, a Run CAS records running status and a fresh execution identity. Reconciliation republishes that same identity after interruptions.
 
 Step messages carry both Step index and execution identity. The executor rejects stale generations even after the JetStream dedup window. Registration writes preserve the execution identity. Retry, wakeup and successful Step advancement create a fresh identity.
 
@@ -42,7 +42,7 @@ A successful Step commits its State, next Step and consumed submission ID togeth
 
 The default payload limit is 64 KiB. `Config.HookPayloadLimit`, `HookMaxBytes` and `StepMaxBytes` configure limits. Both stores reject new writes when full; accepted input is never evicted to admit other input. Hook and Step stores each default to 64 MiB. Hook capacity includes permanent reservations, which grow over time and eventually require more storage. Hook history is one revision so cleanup removes retained payloads and receipts.
 
-Terminal Runs receive a seven-day retention deadline. Retry clears it through a Run revision check. Cleanup purges the Run with its last revision, so Retry and deletion cannot both win. Only after Run removal does cleanup strip Hook payloads and receipts, preserving the token reservation as `gone`. A separate reservation scan recovers interrupted cleanup. Unknown tokens return not found; cleaned tokens return gone.
+Terminal Runs receive a seven-day retention deadline. Retry clears it through a Run revision check. Cleanup purges the Run with its last revision, so Retry and deletion cannot both win. Only after Run removal does cleanup strip Hook payloads and receipts, preserving the token reservation as `gone`. A reservation scan when `Serve` starts recovers interrupted cleanup. Unknown tokens return not found; cleaned tokens return gone.
 
 ## Scheduling and failure
 

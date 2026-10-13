@@ -365,23 +365,57 @@ func (e *Engine) Serve(ctx context.Context) error {
 		e.executeSteps(ctx, &callbacks)
 	}()
 	startsClosed := sc.Closed()
+	runWatch, err := e.kv.WatchAll(ctx)
+	if err != nil {
+		return unlessCancelled(ctx, err)
+	}
+	defer runWatch.Stop()
+	hookWatch, err := e.hooks.WatchAll(ctx)
+	if err != nil {
+		return unlessCancelled(ctx, err)
+	}
+	defer hookWatch.Stop()
+	e.cleanHooks(ctx)
+	runs := map[string]*maintained{}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		e.maintainRuns(ctx)
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-startsClosed:
 			return errors.New("schedule consumer stopped unexpectedly")
 		case <-stepsClosed:
-			if ctx.Err() != nil {
-				return nil
+			return unlessCancelled(ctx, errors.New("step consumer stopped unexpectedly"))
+		case entry, ok := <-runWatch.Updates():
+			if !ok {
+				return unlessCancelled(ctx, errors.New("run watch stopped unexpectedly"))
 			}
-			return errors.New("step consumer stopped unexpectedly")
+			// A nil entry ends the stored Runs. Repair them without waiting for the ticker.
+			if entry == nil {
+				e.maintainRuns(ctx, runs)
+				continue
+			}
+			e.observeRun(runs, entry)
+		case entry, ok := <-hookWatch.Updates():
+			if !ok {
+				return unlessCancelled(ctx, errors.New("hook watch stopped unexpectedly"))
+			}
+			if entry != nil {
+				observeHook(runs, entry)
+			}
 		case <-ticker.C:
+			e.maintainRuns(ctx, runs)
 		}
 	}
+}
+
+// Serve ends without an error once its context is cancelled.
+func unlessCancelled(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 // executeSteps pulls a Step only when a slot is free. A prefetched delivery

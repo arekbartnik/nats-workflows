@@ -157,34 +157,80 @@ func (e *Engine) handleStart(ctx context.Context, msg jetstream.Msg) {
 	msg.Ack()
 }
 
-func (e *Engine) maintainRuns(ctx context.Context) {
-	runs, err := e.ListRuns(ctx)
-	if err != nil {
-		if ctx.Err() == nil {
-			e.log.Warn("listing runs for maintenance", "err", err)
+// maintained is Serve's copy of a Run, kept current by the Run watch.
+type maintained struct {
+	run *Run
+	// Nothing is left to repair until the Run or one of its Hooks changes.
+	settled bool
+	// The Run was removed and its Hooks may still hold input.
+	gone bool
+}
+
+func (e *Engine) observeRun(runs map[string]*maintained, entry jetstream.KeyValueEntry) {
+	if entry.Operation() != jetstream.KeyValuePut {
+		if m := runs[entry.Key()]; m != nil {
+			m.gone = true
 		}
 		return
 	}
-	for _, run := range runs {
-		e.reconcileRunHooks(ctx, run)
-		if run.Status == StatusScheduled {
-			if err := e.publishSchedule(ctx, run); err != nil {
-				e.log.Warn("repairing schedule", "run", run.ID, "err", err)
-			}
-		} else if run.Status.Terminal() {
+	run, err := runFromEntry(entry)
+	if err != nil {
+		e.log.Warn("skipping unreadable run", "key", entry.Key(), "err", err)
+		delete(runs, entry.Key())
+		return
+	}
+	runs[entry.Key()] = &maintained{run: run}
+}
+
+func observeHook(runs map[string]*maintained, entry jetstream.KeyValueEntry) {
+	var h Hook
+	if entry.Operation() != jetstream.KeyValuePut || json.Unmarshal(entry.Value(), &h) != nil {
+		return
+	}
+	if m := runs[h.RunID]; m != nil {
+		m.settled = false
+	}
+}
+
+// maintainRuns repairs what interruptions left undone. A settled Run costs
+// no request, so a pass is as large as the Runs that changed, are running, or
+// are due.
+func (e *Engine) maintainRuns(ctx context.Context, runs map[string]*maintained) {
+	now := time.Now()
+	for id, m := range runs {
+		// A repair changes its Run. The watch delivers what was stored.
+		run := *m.run
+		if !m.gone && run.Status.Terminal() {
 			expiry := run.ExpiresAt
 			if expiry == nil {
 				legacy := run.Updated.Add(7 * 24 * time.Hour)
 				expiry = &legacy
 			}
-			if !expiry.After(time.Now()) {
+			if !expiry.After(now) {
 				if err := e.kv.Purge(ctx, run.ID, jetstream.LastRevision(run.rev)); err != nil {
 					e.log.Warn("expiring run", "run", run.ID, "err", err)
+					continue
 				}
+				m.gone = true
+			}
+		}
+		if m.gone {
+			if e.cleanRunHooks(ctx, &run) {
+				delete(runs, id)
+			}
+			continue
+		}
+		if m.settled && (run.Status != StatusScheduled || run.StartAt.After(now)) {
+			continue
+		}
+		m.settled = e.reconcileRunHooks(ctx, &run)
+		if run.Status == StatusScheduled {
+			if err := e.publishSchedule(ctx, &run); err != nil {
+				e.log.Warn("repairing schedule", "run", run.ID, "err", err)
+				m.settled = false
 			}
 		}
 	}
-	e.cleanHooks(ctx)
 	// Info mutates the client's cached stream metadata. Use a separate handle
 	// so concurrent schedule lookups do not race that mutation in nats.go.
 	snapshot, err := e.js.Stream(ctx, e.names.schedules)
@@ -198,6 +244,9 @@ func (e *Engine) maintainRuns(ctx context.Context) {
 	for subject := range info.State.Subjects {
 		parts := strings.Split(subject, ".")
 		if len(parts) != 4 {
+			continue
+		}
+		if m := runs[parts[2]]; m != nil && !m.gone && m.run.Status == StatusScheduled && e.scheduleSubject(m.run) == subject {
 			continue
 		}
 		run, err := e.GetRun(ctx, parts[2])

@@ -66,7 +66,7 @@ func TestHookCleanupRacesRetry(t *testing.T) {
 		var wg sync.WaitGroup
 		wg.Add(2)
 		go func() { defer wg.Done(); retryErr = e.Retry(ctx, id) }()
-		go func() { defer wg.Done(); e.maintainRuns(ctx) }()
+		go func() { defer wg.Done(); e.maintainRuns(ctx, map[string]*maintained{id: {run: r}}) }()
 		wg.Wait()
 		e.cleanHooks(ctx)
 		h, err = e.GetHook(ctx, h.Token)

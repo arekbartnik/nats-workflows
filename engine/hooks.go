@@ -425,30 +425,44 @@ func (e *Engine) RunHooks(ctx context.Context, r *Run) ([]*Hook, error) {
 	return hooks, nil
 }
 
-func (e *Engine) reconcileRunHooks(ctx context.Context, r *Run) {
+// reconcileRunHooks reports whether the Run needs nothing more until it or
+// one of its Hooks changes.
+func (e *Engine) reconcileRunHooks(ctx context.Context, r *Run) bool {
+	settled := true
 	for _, w := range r.HookWaits {
 		h, err := e.reserveHook(ctx, r, w)
+		if errors.Is(err, ErrHookConflict) || errors.Is(err, ErrHookGone) {
+			continue
+		}
 		if err != nil {
+			settled = false
 			continue
 		}
 		if w.Consumed != "" && h.Receipt != nil && h.Receipt.SubmissionID == w.Consumed {
 			if h.Status != HookConsumed {
 				h.Status = HookConsumed
-				_ = e.saveHook(ctx, h)
+				if e.saveHook(ctx, h) != nil {
+					settled = false
+				}
 			}
 		} else if h.Receipt != nil && r.Status == StatusParked && w.Step == r.Step {
 			r.Status = StatusRunning
 			r.Execution = uuid.NewString()
 			if e.putRun(ctx, r) != nil {
-				return
+				return false
 			}
 		}
 	}
 	if r.Status == StatusRunning {
+		// A running Run is never settled, because only a stored Step message moves it.
 		_ = e.enqueue(ctx, r, r.Step)
+		return false
 	}
+	return settled
 }
 
+// cleanHooks scans every reservation, which recovers a cleanup that was
+// interrupted while no worker was serving.
 func (e *Engine) cleanHooks(ctx context.Context) {
 	keys, err := e.hooks.ListKeys(ctx)
 	if err != nil {
@@ -460,18 +474,42 @@ func (e *Engine) cleanHooks(ctx context.Context) {
 			continue
 		}
 		var h Hook
-		if json.Unmarshal(entry.Value(), &h) != nil || h.Status == HookGone {
+		if json.Unmarshal(entry.Value(), &h) != nil {
 			continue
 		}
 		h.rev = entry.Revision()
-		if _, err = e.GetRun(ctx, h.RunID); !errors.Is(err, jetstream.ErrKeyNotFound) {
+		_ = e.cleanHook(ctx, &h)
+	}
+}
+
+// cleanRunHooks reports whether no Hook of the removed Run holds input.
+func (e *Engine) cleanRunHooks(ctx context.Context, r *Run) bool {
+	clean := true
+	for _, w := range r.HookWaits {
+		h, err := e.GetHook(ctx, w.Token)
+		if errors.Is(err, jetstream.ErrKeyNotFound) {
 			continue
 		}
-		h.Status = HookGone
-		h.Payload = nil
-		h.Receipt = nil
-		_ = e.saveHook(ctx, &h)
+		if err != nil || (h.RunID == r.ID && e.cleanHook(ctx, h) != nil) {
+			clean = false
+		}
 	}
+	return clean
+}
+
+// cleanHook strips the Hook's input once its Run is gone and keeps the token
+// reserved.
+func (e *Engine) cleanHook(ctx context.Context, h *Hook) error {
+	if h.Status == HookGone {
+		return nil
+	}
+	if _, err := e.GetRun(ctx, h.RunID); !errors.Is(err, jetstream.ErrKeyNotFound) {
+		return err
+	}
+	h.Status = HookGone
+	h.Payload = nil
+	h.Receipt = nil
+	return e.saveHook(ctx, h)
 }
 
 func canonicalDecimal(s string) string {
