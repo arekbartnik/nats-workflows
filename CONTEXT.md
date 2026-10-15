@@ -34,6 +34,10 @@ _Avoid_: approve (approval is one reason to park, not the operation)
 **Hook**:
 A durable, addressable input owned by a Run that accepts one event. Later waits use separate Hooks.
 
+**Webhook**:
+A Hook that services outside the application call over HTTP at an engine-generated address. Each call is authenticated by the application before it is stored, and calls the Step does not wait for are declined while the Webhook keeps waiting.
+_Avoid_: callback URL, endpoint
+
 **Retry**:
 Re-running a failed Run from the Step that failed, with a fresh retry budget.
 _Avoid_: restart (a Retry never rewinds earlier Steps)

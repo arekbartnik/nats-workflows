@@ -23,6 +23,8 @@ var (
 	ErrHookConflict   = errors.New("hook conflict")
 	ErrHookGone       = errors.New("hook gone")
 	ErrHookCapacity   = errors.New("hook storage capacity exhausted")
+	// The contract's accept function declined the input; the Hook keeps waiting.
+	ErrHookRefused = errors.New("hook input refused")
 )
 
 // Change the version when validation rules change; existing Hooks retain
@@ -31,6 +33,9 @@ type InputContract struct {
 	ID       string
 	typ      reflect.Type
 	validate func(json.RawMessage) error
+	// Set only on webhook contracts.
+	verify func(Request) error
+	accept func(json.RawMessage) bool
 }
 
 // HookType accepts one JSON value of T, rejecting unknown object fields and
@@ -317,6 +322,9 @@ func (e *Engine) Submit(ctx context.Context, s Submission) (*Receipt, error) {
 		}
 		if err = contract.validate(s.Payload); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrHookValidation, err)
+		}
+		if contract.accept != nil && !contract.accept(s.Payload) {
+			return nil, ErrHookRefused
 		}
 		h.Payload = normalized
 		h.Receipt = &Receipt{Token: h.Token, SubmissionID: s.SubmissionID, AcceptedAt: time.Now().UTC()}

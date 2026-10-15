@@ -7,6 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -379,4 +382,105 @@ func TestOrderApprovalHooks(t *testing.T) {
 	if r := wait(t, e, id); r.Status != engine.StatusDone || e.Result(r) == "" {
 		t.Fatalf("order: %+v", r)
 	}
+}
+
+type callbackStatus struct {
+	State string `json:"state"`
+}
+
+func TestWebhookDelivery(t *testing.T) {
+	nc, _ := startEmbedded(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	contract := engine.WebhookType[callbackStatus]("status-v1", func(r engine.Request) error {
+		if r.Header.Get("X-Secret") != "s3cret" {
+			return errors.New("bad secret")
+		}
+		return nil
+	}, func(s callbackStatus) bool { return s.State == "done" })
+	urls := make(chan string, 8)
+	webhook := engine.Workflow{Name: "webhook", Steps: []engine.Step{{Name: "wait", Input: contract, Run: func(ctx context.Context, r *engine.Run) error {
+		u, err := r.Webhook(ctx, "status")
+		if err != nil {
+			return err
+		}
+		urls <- u
+		input, err := engine.HookInput[callbackStatus](ctx, r, "status", "")
+		if err != nil {
+			return err
+		}
+		r.State, _ = json.Marshal(input)
+		return nil
+	}}}}
+	plain := engine.Workflow{Name: "plain", Steps: []engine.Step{hookStep("answer", "")}}
+	var handler http.Handler
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { handler.ServeHTTP(w, r) }))
+	defer srv.Close()
+	e, err := engine.New(ctx, nc, slog.New(slog.NewTextHandler(io.Discard, nil)), engine.Config{WebhookURL: srv.URL + "/hooks/"}, webhook, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handler = e.Webhooks()
+	go e.Serve(ctx)
+
+	id, _ := e.Start(ctx, webhook.Name, nil)
+	wait(t, e, id, engine.StatusParked)
+	target := <-urls
+	if !strings.HasPrefix(target, srv.URL+"/hooks/") {
+		t.Fatalf("webhook address %q is not under the configured URL", target)
+	}
+	post := func(target, secret, body string) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, target, strings.NewReader(body))
+		req.Header.Set("X-Secret", secret)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+	for _, c := range []struct {
+		name, target, secret, body string
+		want                       int
+	}{
+		{"unsigned", target, "wrong", `{"state":"done"}`, http.StatusUnauthorized},
+		{"not json", target, "s3cret", `done`, http.StatusBadRequest},
+		{"too large", target, "s3cret", `{"state":"` + strings.Repeat("x", 70<<10) + `"}`, http.StatusRequestEntityTooLarge},
+		{"unknown token", srv.URL + "/hooks/nope", "s3cret", `{"state":"done"}`, http.StatusNotFound},
+		{"refused state", target, "s3cret", `{"state":"in_progress","added_later":1}`, http.StatusAccepted},
+	} {
+		if got := post(c.target, c.secret, c.body); got != c.want {
+			t.Fatalf("%s: HTTP %d, want %d", c.name, got, c.want)
+		}
+	}
+	if r, _ := e.GetRun(ctx, id); r.Status != engine.StatusParked {
+		t.Fatalf("refused input resumed the run: %s", r.Status)
+	}
+
+	plainID, _ := e.Start(ctx, plain.Name, nil)
+	pr := wait(t, e, plainID, engine.StatusParked)
+	if got := post(srv.URL+"/hooks/"+pr.HookWaits[0].Token, "s3cret", `{"answer":"yes","count":1}`); got != http.StatusNotFound {
+		t.Fatalf("plain hook reachable as a webhook: HTTP %d", got)
+	}
+
+	final := `{"state":"done","updated_at":"2026-10-15T10:00:00Z"}`
+	if got := post(target, "s3cret", final); got != http.StatusAccepted {
+		t.Fatalf("final state: HTTP %d", got)
+	}
+	r := wait(t, e, id, engine.StatusDone)
+	if string(r.State) != `{"state":"done"}` {
+		t.Fatalf("run state %s", r.State)
+	}
+	for _, body := range []string{final, `{"state":"published"}`, `{"state":"done","updated_at":"later"}`} {
+		if got := post(target, "s3cret", body); got != http.StatusAccepted {
+			t.Fatalf("late call %s: HTTP %d", body, got)
+		}
+	}
+	req, _ := http.NewRequest(http.MethodGet, target, nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil || res.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET: %v %v", res.StatusCode, err)
+	}
+	res.Body.Close()
 }

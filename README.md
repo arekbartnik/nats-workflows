@@ -280,6 +280,22 @@ The API assumes trusted local/private access. Hook tokens identify waits and
 are not authentication credentials. See [engine control flow](docs/engine-flow.md)
 for registration, consumption and crash recovery.
 
+## Webhooks
+
+A Webhook is a Hook that an outside service calls over HTTP. Declare the Step
+input with `engine.WebhookType[T](version, verify, accept)`, set
+`engine.Config.WebhookURL` and mount `Engine.Webhooks()` at that address. In
+the Step, `run.Webhook(ctx, name)` registers the Hook and returns its address;
+send that to the service, then wait with `engine.HookInput[T]` under the same
+name.
+
+`verify` sees the headers and raw body and rejects the call with `401`.
+`accept` declines input the Step does not wait for, such as intermediate
+states; the call gets `202` and the Webhook keeps waiting. The body is the
+input and its SHA-256 the submission ID. Duplicates, declined calls and calls
+to used or cleaned-up Webhooks get `202`, so callers stop retrying. Unknown
+tokens and plain Hooks get `404`. See [ADR 0005](docs/adr/0005-webhooks.md).
+
 ## Check Hook delivery
 
 Follow the [manual Hook checks](docs/hooks-manual-check.md) to test approvals,

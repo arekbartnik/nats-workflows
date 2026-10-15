@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"maps"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,9 @@ type Config struct {
 	StepMaxBytes int64
 	// Steps executing at once in this process. Zero defaults to 1.
 	Concurrency int
+	// Where the application serves Webhooks, such as https://app.example/hooks;
+	// Run.Webhook appends the token. Empty disables Run.Webhook.
+	WebhookURL string
 }
 
 // Wrap with %w to fail immediately without using the remaining retry budget.
@@ -144,6 +148,7 @@ type Engine struct {
 	serving          atomic.Bool
 	hooks            jetstream.KeyValue
 	hookPayloadLimit int
+	webhookURL       string
 	js               jetstream.JetStream
 	kv               jetstream.KeyValue
 	cons             jetstream.Consumer
@@ -250,6 +255,7 @@ func New(ctx context.Context, nc *nats.Conn, log *slog.Logger, cfg Config, wfs .
 	e := &Engine{
 		names: names, js: js, kv: kv, cons: cons, workflows: workflows, maxDeliver: cfg.MaxDeliver, log: log,
 		concurrency: cfg.Concurrency,
+		webhookURL:  strings.TrimSuffix(cfg.WebhookURL, "/"),
 		stepTimeout: cfg.BackOff[0],
 		// The server resets the ack timer to the shortest delay at worst.
 		heartbeat: slices.Min(cfg.BackOff) / 3,
