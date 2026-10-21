@@ -273,25 +273,40 @@ func (e *Engine) Start(ctx context.Context, wf string, initial any) (string, err
 	return e.createRun(ctx, wf, initial, nil)
 }
 
-func (e *Engine) createRun(ctx context.Context, wf string, initial any, at *time.Time) (string, error) {
-	if _, ok := e.workflows[wf]; !ok {
-		return "", fmt.Errorf("unknown workflow %q", wf)
+// StartWithID starts wf under the caller's id and returns the run. When a run
+// with that id already exists, nothing starts and the existing run comes back
+// unchanged, so a caller that may run twice starts the workflow once. A caller
+// that needs the run to be its own compares the Workflow and State it gets.
+func (e *Engine) StartWithID(ctx context.Context, id, wf string, initial any) (*Run, error) {
+	if id == "" {
+		return nil, errors.New("run id must not be empty")
 	}
+	run, err := e.newRun(id, wf, initial, nil)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.putRun(ctx, run); err != nil {
+		// Read back after any error, including an ambiguous acknowledgement timeout.
+		existing, getErr := e.GetRun(ctx, id)
+		if getErr != nil {
+			return nil, fmt.Errorf("start run %s: %w", id, errors.Join(err, getErr))
+		}
+		if existing.Execution != run.Execution {
+			return existing, nil
+		}
+		run = existing
+	}
+	return run, e.enqueue(ctx, run, 0)
+}
+
+func (e *Engine) createRun(ctx context.Context, wf string, initial any, at *time.Time) (string, error) {
 	id, err := uuid.NewV7()
 	if err != nil {
 		return "", err
 	}
-	run := &Run{ID: id.String(), Workflow: wf, Status: StatusRunning, Execution: uuid.NewString()}
-	if at != nil {
-		run.Status = StatusScheduled
-		run.StartAt = at
-	}
-	if initial != nil {
-		data, err := json.Marshal(initial)
-		if err != nil {
-			return "", err
-		}
-		run.State = data
+	run, err := e.newRun(id.String(), wf, initial, at)
+	if err != nil {
+		return "", err
 	}
 	if err := e.putRun(ctx, run); err != nil {
 		return "", err
@@ -303,6 +318,25 @@ func (e *Engine) createRun(ctx context.Context, wf string, initial any, at *time
 		return run.ID, nil
 	}
 	return run.ID, e.enqueue(ctx, run, 0)
+}
+
+func (e *Engine) newRun(id, wf string, initial any, at *time.Time) (*Run, error) {
+	if _, ok := e.workflows[wf]; !ok {
+		return nil, fmt.Errorf("unknown workflow %q", wf)
+	}
+	run := &Run{ID: id, Workflow: wf, Status: StatusRunning, Execution: uuid.NewString()}
+	if at != nil {
+		run.Status = StatusScheduled
+		run.StartAt = at
+	}
+	if initial != nil {
+		data, err := json.Marshal(initial)
+		if err != nil {
+			return nil, err
+		}
+		run.State = data
+	}
+	return run, nil
 }
 
 // Retry preserves earlier Steps and gives the failed Step a fresh retry budget.

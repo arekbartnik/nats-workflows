@@ -34,7 +34,9 @@ eng, err := engine.New(ctx, nc, logger,
 ```
 
 Run `eng.Serve(ctx)` in a supervised goroutine and call `eng.Start`,
-`eng.Schedule`, `eng.Submit` or `eng.Wait` from your app. Handle the constructor
+`eng.StartWithID`, `eng.Schedule`, `eng.Submit` or `eng.Wait` from your app.
+`eng.StartWithID` takes the run's id from you and starts the workflow once, so a
+caller that may run twice, such as a redelivered message, is safe. Handle the constructor
 and worker errors. Cancel the worker context and wait for `Serve` to return
 before closing NATS. The engine never closes a connection you supply.
 

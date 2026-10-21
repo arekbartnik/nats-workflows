@@ -124,6 +124,39 @@ func TestHappyPath(t *testing.T) {
 	}
 }
 
+func TestStartWithIDStartsOnceAndAtOnce(t *testing.T) {
+	eng, _ := newTestEngine(t, engine.Workflow{Name: "wf", Steps: []engine.Step{appendStep("s0")}})
+	ctx := context.Background()
+	if _, err := eng.StartWithID(ctx, "order-7", "other", nil); err == nil {
+		t.Fatal("started an unknown workflow")
+	}
+	if _, err := eng.StartWithID(ctx, "", "wf", nil); err == nil {
+		t.Fatal("started a run without an id")
+	}
+	before := time.Now()
+	run, err := eng.StartWithID(ctx, "order-7", "wf", tState{Kept: "first"})
+	if err != nil {
+		t.Fatalf("StartWithID: %v", err)
+	}
+	if run.ID != "order-7" || run.Status != engine.StatusRunning {
+		t.Fatalf("run = %+v", run)
+	}
+	again, err := eng.StartWithID(ctx, "order-7", "wf", tState{Kept: "second"})
+	if err != nil {
+		t.Fatalf("second StartWithID: %v", err)
+	}
+	if again.ID != run.ID || stateOf(t, again).Kept != "first" {
+		t.Fatalf("second start replaced the run: %+v", again)
+	}
+	done := wait(t, eng, "order-7")
+	if elapsed := time.Since(before); elapsed > 500*time.Millisecond {
+		t.Fatalf("run finished after %v, want it enqueued without waiting for the maintenance tick", elapsed)
+	}
+	if s := stateOf(t, done); done.Status != engine.StatusDone || s.Kept != "first" || strings.Join(s.Log, ",") != "s0" {
+		t.Fatalf("run = %q %+v", done.Status, s)
+	}
+}
+
 func TestConditionalPark(t *testing.T) {
 	wf := func() engine.Workflow {
 		return engine.Workflow{
