@@ -127,8 +127,8 @@ func TestHappyPath(t *testing.T) {
 func TestStartWithIDStartsOnceAndAtOnce(t *testing.T) {
 	eng, _ := newTestEngine(t, engine.Workflow{Name: "wf", Steps: []engine.Step{appendStep("s0")}})
 	ctx := context.Background()
-	if _, err := eng.StartWithID(ctx, "order-7", "other", nil); err == nil {
-		t.Fatal("started an unknown workflow")
+	if _, err := eng.StartWithID(ctx, "order-7", "other", nil); !errors.Is(err, engine.ErrUnknownWorkflow) {
+		t.Fatalf("starting an unknown workflow = %v, want ErrUnknownWorkflow", err)
 	}
 	if _, err := eng.StartWithID(ctx, "", "wf", nil); err == nil {
 		t.Fatal("started a run without an id")

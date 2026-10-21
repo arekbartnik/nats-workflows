@@ -46,6 +46,11 @@ type Config struct {
 // Wrap with %w to fail immediately without using the remaining retry budget.
 var ErrTerminal = errors.New("terminal")
 
+// ErrUnknownWorkflow is returned by Start, StartWithID, and Schedule when no
+// registered workflow has the given name. Callers that must settle such a
+// start rather than retry it match this error.
+var ErrUnknownWorkflow = errors.New("unknown workflow")
+
 // State changes survive ErrPark; other Step errors discard them.
 var ErrPark = errors.New("waiting for input")
 
@@ -322,7 +327,7 @@ func (e *Engine) createRun(ctx context.Context, wf string, initial any, at *time
 
 func (e *Engine) newRun(id, wf string, initial any, at *time.Time) (*Run, error) {
 	if _, ok := e.workflows[wf]; !ok {
-		return nil, fmt.Errorf("unknown workflow %q", wf)
+		return nil, fmt.Errorf("%w %q", ErrUnknownWorkflow, wf)
 	}
 	run := &Run{ID: id, Workflow: wf, Status: StatusRunning, Execution: uuid.NewString()}
 	if at != nil {
