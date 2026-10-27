@@ -41,6 +41,8 @@ type Config struct {
 	// Where the application serves Webhooks, such as https://app.example/hooks;
 	// Run.Webhook appends the token. Empty disables Run.Webhook.
 	WebhookURL string
+	// Served by Webhooks next to Webhook tokens. See Trigger.
+	Triggers []Trigger
 }
 
 // Wrap with %w to fail immediately without using the remaining retry budget.
@@ -154,6 +156,8 @@ type Engine struct {
 	hooks            jetstream.KeyValue
 	hookPayloadLimit int
 	webhookURL       string
+	triggers         map[string]Trigger
+	triggerLimit     int
 	js               jetstream.JetStream
 	kv               jetstream.KeyValue
 	cons             jetstream.Consumer
@@ -266,6 +270,9 @@ func New(ctx context.Context, nc *nats.Conn, log *slog.Logger, cfg Config, wfs .
 		heartbeat: slices.Min(cfg.BackOff) / 3,
 	}
 	if err := e.initHooks(ctx, cfg); err != nil {
+		return nil, err
+	}
+	if err := e.initTriggers(ctx, cfg.Triggers, nc.MaxPayload()); err != nil {
 		return nil, err
 	}
 	if err := e.initSchedules(ctx); err != nil {

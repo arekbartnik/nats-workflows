@@ -38,6 +38,10 @@ A durable, addressable input owned by a Run that accepts one event. Later waits 
 A Hook that services outside the application call over HTTP at an engine-generated address. Each call is authenticated by the application before it is stored, and calls the Step does not wait for are declined while the Webhook keeps waiting.
 _Avoid_: callback URL, endpoint
 
+**Trigger**:
+A stable token, chosen by the application and bound to a Workflow, that starts a new Run for every verified call from an outside service. A repeated delivery is a duplicate and starts nothing. Its token is reserved in the Hook token space and never reassigned.
+_Avoid_: reusable hook, multi-event webhook
+
 **Retry**:
 Re-running a failed Run from the Step that failed, with a fresh retry budget.
 _Avoid_: restart (a Retry never rewinds earlier Steps)

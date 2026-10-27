@@ -89,7 +89,8 @@ func (r *Run) Webhook(ctx context.Context, name string) (string, error) {
 // Webhooks serves POST <Config.WebhookURL>/<token>; mount it there. The body
 // is the Hook input and its SHA-256 the submission ID, so a repeated call is
 // a duplicate. Calls that cannot change anything any more are answered 202, so
-// callers stop retrying them.
+// callers stop retrying them. A Trigger token starts a Run per delivery
+// instead.
 func (e *Engine) Webhooks() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -107,6 +108,10 @@ func (e *Engine) Webhooks() http.Handler {
 			return
 		}
 		token := path.Base(r.URL.Path)
+		if t, ok := e.triggers[token]; ok {
+			e.serveTrigger(w, r, t, body)
+			return
+		}
 		contract, err := e.webhookContract(r.Context(), token)
 		switch {
 		case errors.Is(err, ErrHookGone):
@@ -147,7 +152,8 @@ func (e *Engine) webhookContract(ctx context.Context, token string) (*InputContr
 	if err != nil {
 		return nil, err
 	}
-	if h.Status == HookGone {
+	// A removed Trigger keeps its reservation, so its old address stays used.
+	if h.Status == HookGone || h.Status == HookTrigger {
 		return nil, ErrHookGone
 	}
 	run, err := e.GetRun(ctx, h.RunID)

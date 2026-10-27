@@ -290,6 +290,9 @@ func (e *Engine) Submit(ctx context.Context, s Submission) (*Receipt, error) {
 		if h.Status == HookGone {
 			return nil, ErrHookGone
 		}
+		if h.Status == HookTrigger {
+			return nil, fmt.Errorf("%w: token belongs to a trigger", jetstream.ErrKeyNotFound)
+		}
 		if h.Receipt != nil {
 			if h.Receipt.SubmissionID == s.SubmissionID && equivalentJSON(h.Payload, normalized) {
 				return h.Receipt, nil
@@ -501,7 +504,7 @@ func (e *Engine) stripHooksOfRemovedRun(ctx context.Context, removed *Run) error
 }
 
 func (e *Engine) stripHookIfOrphaned(ctx context.Context, h *Hook) error {
-	if h.Status == HookGone {
+	if h.Status == HookGone || h.Status == HookTrigger {
 		return nil
 	}
 	if _, err := e.GetRun(ctx, h.RunID); !errors.Is(err, jetstream.ErrKeyNotFound) {

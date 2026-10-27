@@ -484,3 +484,179 @@ func TestWebhookDelivery(t *testing.T) {
 	}
 	res.Body.Close()
 }
+
+type delivery struct {
+	Event      string `json:"event"`
+	DeliveryID string `json:"delivery_id"`
+	Project    int    `json:"project"`
+	Seen       bool   `json:"seen,omitempty"`
+}
+
+var deliveryContract = engine.WebhookType[delivery]("delivery-v1", func(r engine.Request) error {
+	if r.Header.Get("X-Secret") != "s3cret" {
+		return errors.New("bad secret")
+	}
+	return nil
+}, func(d delivery) bool { return d.Event != "progress" })
+
+func deliveryKey(body []byte) (string, error) {
+	var d delivery
+	err := json.Unmarshal(body, &d)
+	return d.DeliveryID, err
+}
+
+var inbox = engine.Workflow{Name: "inbox", Steps: []engine.Step{{Name: "route", Run: engine.Typed(func(ctx context.Context, r *engine.Run, d *delivery) error {
+	d.Seen = true
+	return nil
+})}}}
+
+func inboxTrigger(token string) engine.Trigger {
+	return engine.Trigger{Token: token, Workflow: inbox.Name, Input: deliveryContract, Key: deliveryKey}
+}
+
+func triggerServer(t *testing.T, e *engine.Engine) func(token, secret, body string) int {
+	t.Helper()
+	srv := httptest.NewServer(e.Webhooks())
+	t.Cleanup(srv.Close)
+	return func(token, secret, body string) int {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/hooks/"+token, strings.NewReader(body))
+		req.Header.Set("X-Secret", secret)
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res.Body.Close()
+		return res.StatusCode
+	}
+}
+
+func runsOf(t *testing.T, e *engine.Engine, workflow string) []*engine.Run {
+	t.Helper()
+	runs, err := e.ListRuns(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var of []*engine.Run
+	for _, r := range runs {
+		if r.Workflow == workflow {
+			of = append(of, r)
+		}
+	}
+	return of
+}
+
+func TestTriggerStartsOneRunPerDelivery(t *testing.T) {
+	nc, _ := startEmbedded(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	taken := engine.Workflow{Name: "taken", Steps: []engine.Step{hookStep("answer", "inbox-old")}}
+	e, err := engine.New(ctx, nc, slog.New(slog.NewTextHandler(io.Discard, nil)), engine.Config{
+		BackOff: []time.Duration{50 * time.Millisecond}, MaxDeliver: 2,
+		Triggers: []engine.Trigger{inboxTrigger("inbox-old"), inboxTrigger("inbox-new")},
+	}, inbox, taken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go e.Serve(ctx)
+	post := triggerServer(t, e)
+
+	first := `{"event":"ready","delivery_id":"01M4QGYFNGAY47SX2N1D0K3JCC","project":16710`
+	for _, c := range []struct {
+		name, token, secret, body string
+		want                      int
+	}{
+		{"unsigned", "inbox-new", "wrong", first + "}", http.StatusUnauthorized},
+		{"not an object", "inbox-new", "s3cret", `[1,2]`, http.StatusBadRequest},
+		{"null", "inbox-new", "s3cret", `null`, http.StatusBadRequest},
+		{"no delivery id", "inbox-new", "s3cret", `{"event":"ready","project":1}`, http.StatusBadRequest},
+		{"declined", "inbox-new", "s3cret", `{"event":"progress","delivery_id":"p1"}`, http.StatusAccepted},
+		{"too large", "inbox-new", "s3cret", first + `,"pad":"` + strings.Repeat("x", 70<<10) + `"}`, http.StatusRequestEntityTooLarge},
+		{"unknown token", "inbox-nope", "s3cret", first + "}", http.StatusNotFound},
+	} {
+		if got := post(c.token, c.secret, c.body); got != c.want {
+			t.Fatalf("%s: HTTP %d, want %d", c.name, got, c.want)
+		}
+	}
+	if runs := runsOf(t, e, inbox.Name); len(runs) != 0 {
+		t.Fatalf("rejected calls started %d runs", len(runs))
+	}
+
+	codes := make([]int, 20)
+	var wg sync.WaitGroup
+	for i := range codes {
+		wg.Go(func() { codes[i] = post("inbox-new", "s3cret", fmt.Sprintf(`%s,"sent_at":"%d"}`, first, i)) })
+	}
+	wg.Wait()
+	for i, code := range codes {
+		if code != http.StatusAccepted {
+			t.Fatalf("retry %d of one delivery: HTTP %d", i, code)
+		}
+	}
+	runs := runsOf(t, e, inbox.Name)
+	if len(runs) != 1 {
+		t.Fatalf("20 retries of one delivery started %d runs", len(runs))
+	}
+	d, err := engine.StateOf[delivery](wait(t, e, runs[0].ID, engine.StatusDone))
+	if err != nil || !d.Seen || d.Project != 16710 {
+		t.Fatalf("run state %+v, %v", d, err)
+	}
+
+	if got := post("inbox-new", "s3cret", `{"event":"failed","delivery_id":"second","project":16710}`); got != http.StatusAccepted {
+		t.Fatalf("second delivery: HTTP %d", got)
+	}
+	if got := post("inbox-old", "s3cret", first+"}"); got != http.StatusAccepted {
+		t.Fatalf("first delivery on the old token: HTTP %d", got)
+	}
+	if runs := runsOf(t, e, inbox.Name); len(runs) != 3 {
+		t.Fatalf("a new delivery and a second token should each start a run, got %d runs", len(runs))
+	}
+
+	if _, err := e.Submit(ctx, engine.Submission{Token: "inbox-new", SubmissionID: "x", Payload: json.RawMessage(`{}`)}); !errors.Is(err, jetstream.ErrKeyNotFound) {
+		t.Fatalf("Submit to a trigger token: %v", err)
+	}
+	id, _ := e.Start(ctx, taken.Name, nil)
+	if r := wait(t, e, id, engine.StatusFailed); !strings.Contains(r.Error, engine.ErrHookConflict.Error()) {
+		t.Fatalf("a Hook took a trigger token: %+v", r)
+	}
+}
+
+func TestTriggerTokenReservation(t *testing.T) {
+	nc, _ := startEmbedded(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	discard := slog.New(slog.NewTextHandler(io.Discard, nil))
+	plain := engine.Workflow{Name: "plain", Steps: []engine.Step{hookStep("answer", "held-by-hook")}}
+	e, err := engine.New(ctx, nc, discard, engine.Config{Triggers: []engine.Trigger{inboxTrigger("retired")}}, inbox, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go e.Serve(ctx)
+	id, _ := e.Start(ctx, plain.Name, nil)
+	wait(t, e, id, engine.StatusParked)
+
+	if _, err := engine.New(ctx, nc, discard, engine.Config{Triggers: []engine.Trigger{inboxTrigger("held-by-hook")}}, inbox, plain); err == nil || !strings.Contains(err.Error(), "already a hook token") {
+		t.Fatalf("trigger over a Hook token: %v", err)
+	}
+	moved := engine.Trigger{Token: "retired", Workflow: plain.Name, Input: deliveryContract}
+	if _, err := engine.New(ctx, nc, discard, engine.Config{Triggers: []engine.Trigger{moved}}, inbox, plain); err == nil || !strings.Contains(err.Error(), "reserved for") {
+		t.Fatalf("trigger token moved to another workflow: %v", err)
+	}
+	if _, err := engine.New(ctx, nc, discard, engine.Config{Triggers: []engine.Trigger{{Token: "has/slash", Workflow: inbox.Name, Input: deliveryContract}}}, inbox, plain); err == nil {
+		t.Fatal("trigger token with a slash accepted")
+	}
+
+	without, err := engine.New(ctx, nc, discard, engine.Config{}, inbox, plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := triggerServer(t, without)("retired", "s3cret", `{"event":"ready","delivery_id":"late"}`); got != http.StatusAccepted {
+		t.Fatalf("removed trigger: HTTP %d, want 202", got)
+	}
+	if runs := runsOf(t, without, inbox.Name); len(runs) != 0 {
+		t.Fatalf("removed trigger started %d runs", len(runs))
+	}
+	if r, _ := e.GetRun(ctx, id); r.Status != engine.StatusParked {
+		t.Fatalf("Hook holder changed: %s", r.Status)
+	}
+}

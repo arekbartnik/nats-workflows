@@ -298,6 +298,43 @@ input and its SHA-256 the submission ID. Duplicates, declined calls and calls
 to used or cleaned-up Webhooks get `202`, so callers stop retrying. Unknown
 tokens and plain Hooks get `404`. See [ADR 0005](docs/adr/0005-webhooks.md).
 
+## Webhook triggers
+
+A Trigger takes many calls on one address. Each verified call starts a new Run
+of the bound workflow, with the request body as the Run's initial State. Use it
+when a service keeps one callback URL for many events, so no single Run could
+own the address.
+
+```go
+cfg.Triggers = []engine.Trigger{{
+	Token:    os.Getenv("VENDOR_CALLBACK_TOKEN"),
+	Workflow: "vendor-callback-v1",
+	Input:    engine.WebhookType[Callback]("v1", verify, accept),
+	Key:      deliveryID,
+}}
+```
+
+Give the service `Config.WebhookURL + "/" + Token`, which `Engine.Webhooks()`
+serves. `Key` names the delivery, so a retried delivery starts no second Run.
+Without `Key`, the body's SHA-256 names it, and a retry that changes any byte,
+such as a send time, starts another Run. Run IDs are UUIDs derived from the
+token and the key.
+
+The handler answers `401` when `verify` fails and `400` when the body does not
+decode into the input type or `Key` fails. It answers `202` with no Run when
+`accept` declines, and `413` when the body exceeds `HookPayloadLimit` or cannot
+fit a NATS message. It answers `202` once the Run is stored. Only a call that
+stored no Run gets `503`, after at most 5 seconds, so retrying is always safe.
+A delivery stops being a duplicate when its Run is cleaned up, seven days after
+it ends.
+
+Tokens use 1-256 ASCII letters, digits, underscores or hyphens. They share the
+token space of Hooks. `New` fails when a token already belongs to a Hook or to
+another workflow's Trigger, and a Hook cannot take a Trigger's token. Removing a
+Trigger keeps its token reserved, and calls to it get `202` and start nothing.
+To rotate a token, list the old and the new token for the same workflow until
+the service has the new address. See [ADR 0006](docs/adr/0006-triggers.md).
+
 ## Check Hook delivery
 
 Follow the [manual Hook checks](docs/hooks-manual-check.md) to test approvals,
