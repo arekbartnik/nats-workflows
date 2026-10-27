@@ -165,6 +165,7 @@ type Engine struct {
 	starts           jetstream.Consumer
 	workflows        map[string]Workflow
 	maxDeliver       int
+	backOff          []time.Duration
 	concurrency      int
 	stepTimeout      time.Duration
 	heartbeat        time.Duration
@@ -263,6 +264,7 @@ func New(ctx context.Context, nc *nats.Conn, log *slog.Logger, cfg Config, wfs .
 
 	e := &Engine{
 		names: names, js: js, kv: kv, cons: cons, workflows: workflows, maxDeliver: cfg.MaxDeliver, log: log,
+		backOff:     cfg.BackOff,
 		concurrency: cfg.Concurrency,
 		webhookURL:  strings.TrimSuffix(cfg.WebhookURL, "/"),
 		stepTimeout: cfg.BackOff[0],
@@ -627,7 +629,7 @@ func (e *Engine) fail(ctx context.Context, msg jetstream.Msg, run *Run, err erro
 	md, mdErr := msg.Metadata()
 	if !errors.Is(err, ErrTerminal) && mdErr == nil && md.NumDelivered < uint64(e.maxDeliver) {
 		e.log.Warn("step failed, will retry", "run", run.ID, "step", run.Step, "attempt", md.NumDelivered, "err", err)
-		msg.Nak()
+		msg.NakWithDelay(e.backOff[min(int(md.NumDelivered)-1, len(e.backOff)-1)])
 		return
 	}
 	run.Status = StatusFailed

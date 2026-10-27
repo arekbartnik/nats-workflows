@@ -48,7 +48,7 @@ Terminal Runs receive a seven-day retention deadline. Retry clears it through a 
 
 Scheduled Runs use the native `WF_SCHEDULES` stream. Reconciliation republishes missing schedules, and the starter claims a due Run before enqueuing its first Step. Cancel and Reschedule use Run revision checks. See [scheduled Runs](scheduled-runs.md).
 
-Step failures use the consumer delivery budget. `ErrTerminal` fails immediately; the last failed delivery also records failed status. Retry starts the failed Step with a fresh execution identity and budget. Earlier Step outputs remain committed.
+Step failures use the consumer delivery budget. A retryable failure is Nakked with the `BackOff` delay for the attempt that failed, because a plain Nak redelivers at once. `ErrTerminal` fails immediately; the last failed delivery also records failed status. Retry starts the failed Step with a fresh execution identity and budget. Earlier Step outputs remain committed.
 
 | Interruption | Recovery |
 | --- | --- |

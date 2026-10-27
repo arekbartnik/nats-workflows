@@ -201,7 +201,7 @@ func TestHookRegistrationRecoveryAndTokenConflict(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	wf := engine.Workflow{Name: "recover-hook", Steps: []engine.Step{hookStep("answer", "shared")}}
-	e, err := engine.New(ctx, nc, slog.New(slog.NewTextHandler(io.Discard, nil)), engine.Config{}, wf)
+	e, err := engine.New(ctx, nc, slog.New(slog.NewTextHandler(io.Discard, nil)), engine.Config{BackOff: []time.Duration{30 * time.Millisecond}, MaxDeliver: 2}, wf)
 	if err != nil {
 		t.Fatal(err)
 	}
