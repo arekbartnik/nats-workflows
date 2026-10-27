@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -343,6 +344,56 @@ func TestRetryBudget(t *testing.T) {
 	}
 	if n := attempts.Load(); n != 5 {
 		t.Fatalf("attempts = %d, want 5", n)
+	}
+}
+
+func TestRetriesFollowBackOff(t *testing.T) {
+	backOff := []time.Duration{300 * time.Millisecond, 600 * time.Millisecond}
+	nc, _ := startEmbedded(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var (
+		mu       sync.Mutex
+		attempts []time.Time
+	)
+	eng, err := engine.New(ctx, nc, slog.New(slog.NewTextHandler(io.Discard, nil)),
+		engine.Config{BackOff: backOff, MaxDeliver: 3},
+		engine.Workflow{Name: "wf", Steps: []engine.Step{{
+			Name: "flaky",
+			Run: func(ctx context.Context, run *engine.Run) error {
+				mu.Lock()
+				defer mu.Unlock()
+				attempts = append(attempts, time.Now())
+				if len(attempts) <= 2 {
+					return errors.New("transient")
+				}
+				return nil
+			},
+		}}})
+	if err != nil {
+		t.Fatalf("engine.New: %v", err)
+	}
+	go eng.Serve(ctx)
+	id, err := eng.Start(ctx, "wf", nil)
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	run := wait(t, eng, id)
+	if run.Status != engine.StatusDone {
+		t.Fatalf("status = %q, want done (err %q)", run.Status, run.Error)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(attempts) != 3 {
+		t.Fatalf("attempts = %d, want 3", len(attempts))
+	}
+	for i, want := range backOff {
+		gap := attempts[i+1].Sub(attempts[i])
+		t.Logf("gap between attempt %d and %d = %v (BackOff %v)", i+1, i+2, gap, want)
+		if gap < want {
+			t.Errorf("attempt %d followed attempt %d after %v, want at least %v", i+2, i+1, gap, want)
+		}
 	}
 }
 
